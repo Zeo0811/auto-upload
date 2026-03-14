@@ -5,6 +5,8 @@
   if (window.__autoUploaderRunning) return;
   window.__autoUploaderRunning = true;
 
+  const IS_TOP_FRAME = window === window.top;
+
   const BASE_URL = 'http://127.0.0.1:7788';
 
   // -------------------------------------------------------------------------
@@ -86,7 +88,8 @@
     }
     if (platform === 'channels') {
       if (location.pathname.includes('/login')) return true;
-      return !!document.querySelector('.login-qrcode-wrap');
+      return !!(document.querySelector('[class*="qrcode-wrap"], [class*="login-qrcode"]') ||
+                Array.from(document.querySelectorAll('span,div')).some(el => el.childElementCount === 0 && (el.textContent || '').includes('微信扫码登录')));
     }
     return location.pathname.includes('/login');
   }
@@ -134,14 +137,59 @@
 
   // 视频号登录
   async function checkAndHandleChannelsLogin(accountId) {
-    await sleep(2000);
+    // 等待 .login-content 出现（说明页面框架已加载）
+    let loginContent = null;
+    for (let i = 0; i < 60; i++) {
+      loginContent = document.querySelector('.login-content');
+      if (loginContent) break;
+      await sleep(500);
+    }
 
-    // 取 .qrcode img（精确选择器），src 是 data:image/png;base64
-    const qrImg = document.querySelector('.login-qrcode-wrap img.qrcode');
+    // 再等 5 秒让 QR iframe 渲染完成（QR 在跨域 iframe 里，DOM 里看不到但像素会被截到）
+    console.log('[Auto Upload] login-content 已出现，等待 QR iframe 渲染...');
+    await sleep(5000);
+
+    // 重新取坐标 —— 找水平最居中的那个（carousel 里有多个 .login-content）
+    const allContents = Array.from(document.querySelectorAll('.login-content'));
+    const vw = window.innerWidth;
+    loginContent = allContents.reduce((best, el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return best;
+      const cx = r.left + r.width / 2;
+      if (!best) return el;
+      const br = best.getBoundingClientRect();
+      const bestCx = br.left + br.width / 2;
+      return Math.abs(cx - vw / 2) < Math.abs(bestCx - vw / 2) ? el : best;
+    }, null);
+    let clip;
+    if (loginContent) {
+      const r = loginContent.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        // getBoundingClientRect 是视口坐标，CDP clip 需要页面坐标（加上滚动偏移）
+        clip = {
+          x: r.left + window.scrollX,
+          y: r.top + window.scrollY,
+          width: r.width,
+          height: r.height,
+        };
+        console.log('[Auto Upload] 截图区域 .login-content:', clip, 'scroll:', window.scrollX, window.scrollY);
+      }
+    } else {
+      console.warn('[Auto Upload] 未找到 .login-content，将截全图');
+    }
+    const shot = await chrome.runtime.sendMessage({ type: 'captureScreenshot', ...(clip && { clip }) });
+    const qr_base64 = shot?.ok ? shot.dataUrl : '';
+    if (!qr_base64) {
+      console.warn('[Auto Upload] 视频号截图失败:', shot?.error);
+    } else {
+      console.log('[Auto Upload] 视频号截图成功，长度:', qr_base64.length);
+    }
+
     await postJSON('/login_status', {
       account_id: accountId,
       status: 'qr_required',
-      qr_base64: (qrImg && qrImg.src.startsWith('data:image')) ? qrImg.src : '',
+      qr_base64,
+      qr_url: '',
     });
 
     localStorage.setItem(LOGIN_PENDING_KEY, accountId);
@@ -408,59 +456,62 @@
           await sleep(600);
         }
 
-        // 等待封面编辑器比例选择出现（最多 15s，不再调用 dismissPopups 以免关掉编辑器）
-        let ratioEl = null;
+        // Step 3: 切换封面比例
+        // .ratio-select 是一个 hover 触发的下拉框，需要先 hover 再点击弹出的选项
+        const targetRatio = (meta.cover_ratio || '3:4').replace(/：/g, ':').replace(/\s+/g, '');
+        const normRatio = s => s.trim().replace(/：/g, ':').replace(/\s+/g, '');
+
+        // 等待 .ratio-select 出现（最多 15s）
+        let ratioTrigger = null;
         for (let i = 0; i < 30; i++) {
-          ratioEl = document.querySelector('.ratio-select');
-          if (ratioEl) break;
+          ratioTrigger = document.querySelector('.ratio-select');
+          if (ratioTrigger) break;
           await sleep(500);
         }
-        // Step 3: 切换封面比例
-        const targetRatio = (meta.cover_ratio || '3:4').replace('：', ':');
-        if (ratioEl) {
-          // CDP click 打开比例下拉
-          await chrome.runtime.sendMessage({ type: 'cdpClick', selector: '.ratio-select' });
-          await sleep(1000);
 
-          // 将 "W:H" 或 "W：H" 解析为小数，无法解析返回 null
-          const parseRatio = str => {
-            const m = str.trim().replace(/：/g, ':').replace(/\s+/g, '').match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/);
-            if (!m) return null;
-            const h = parseFloat(m[2]);
-            return h === 0 ? null : parseFloat(m[1]) / h;
-          };
-          const targetVal = parseRatio(targetRatio);
-
-          // 等待比例选项出现（最多 3s），收集所有候选后选最近的
-          let option = null;
-          for (let i = 0; i < 6; i++) {
-            const allEls = Array.from(document.querySelectorAll('li, div, span, button'))
-              .filter(el => el.children.length === 0); // 只看叶节点
-            const candidates = allEls
-              .map(el => ({ el, val: parseRatio(el.innerText || el.textContent || '') }))
-              .filter(c => c.val !== null);
-            if (candidates.length > 0) {
-              if (targetVal !== null) {
-                // 按与目标比值的差值排序，取最近的
-                candidates.sort((a, b) => Math.abs(a.val - targetVal) - Math.abs(b.val - targetVal));
-                option = candidates[0].el;
-              } else {
-                // 目标无法解析时退回精确文字匹配
-                const norm = r => r.trim().replace(/：/g, ':').replace(/\s+/g, '');
-                option = allEls.find(el => norm(el.innerText || el.textContent || '') === norm(targetRatio));
-              }
-              if (option) break;
-            }
-            await sleep(500);
-          }
-          if (option) {
-            const tmpId = '__xhs_ratio_opt_' + Date.now();
-            option.id = tmpId;
-            await chrome.runtime.sendMessage({ type: 'cdpClick', selector: `#${tmpId}` });
-            option.id = '';
-            await sleep(600);
+        if (ratioTrigger) {
+          // 检查当前已选比例，相同则跳过
+          const currentRatio = normRatio(ratioTrigger.querySelector('.ratio-text')?.innerText || '');
+          if (currentRatio === targetRatio) {
+            console.log('[Auto Upload] 封面比例已是目标值:', targetRatio, '，跳过');
           } else {
-            console.warn('[Auto Upload] 未找到比例选项:', targetRatio);
+            console.log('[Auto Upload] 当前比例:', currentRatio, '→ 目标:', targetRatio);
+
+            // hover .ratio-select 触发下拉浮层
+            ratioTrigger.scrollIntoView({ block: 'center', inline: 'nearest' });
+            await sleep(200);
+            await chrome.runtime.sendMessage({ type: 'cdpHover', selector: '.ratio-select' });
+            await sleep(800);
+
+            // 等待下拉选项出现，找 innerText 精确匹配目标比例的选项
+            let option = null;
+            for (let i = 0; i < 10; i++) {
+              // 下拉选项通常在 .ratio-select 同级/父级的浮层里，全局搜索文字匹配的可见元素
+              const candidates = Array.from(document.querySelectorAll('*'))
+                .filter(el =>
+                  normRatio(el.innerText || '') === targetRatio &&
+                  el.offsetParent !== null &&
+                  !el.contains(ratioTrigger)  // 排除触发器本身
+                );
+              // 取最深层（最具体）的元素
+              if (candidates.length > 0) {
+                option = candidates.sort((a, b) => a.contains(b) ? 1 : b.contains(a) ? -1 : 0)[0];
+                break;
+              }
+              await sleep(300);
+            }
+
+            if (option) {
+              console.log('[Auto Upload] 找到比例选项:', option.tagName, option.className, option.innerText);
+              const tmpId = '__xhs_ratio_' + Date.now();
+              option.id = tmpId;
+              const clickRes = await chrome.runtime.sendMessage({ type: 'cdpClick', selector: `#${tmpId}` });
+              option.id = '';
+              console.log('[Auto Upload] 比例点击结果:', JSON.stringify(clickRes));
+              await sleep(600);
+            } else {
+              console.warn('[Auto Upload] hover 后仍未找到比例选项:', targetRatio);
+            }
           }
         } else {
           console.warn('[Auto Upload] 未找到 .ratio-select');
@@ -625,7 +676,13 @@
 
   // -------------------------------------------------------------------------
   // 视频号上传流程
+  // 架构：文件注入用 CDP setFileInput，表单操作用 CDP runInPage（页面 JS 上下文，可访问 iframe.contentDocument）
   // -------------------------------------------------------------------------
+
+  // 在页面 JS 上下文执行表达式的辅助函数
+  function runInPage(expression) {
+    return chrome.runtime.sendMessage({ type: 'runInPage', expression });
+  }
 
   async function runChannelsTask(task) {
     const { task_id, meta } = task;
@@ -634,82 +691,415 @@
     try {
       await postJSON('/progress', { task_id, progress: 5, msg: '视频号：页面准备中' });
 
-      // Step 1: 等页面稳定，清弹窗
+      // Step 1: 等页面稳定
       await sleep(2000);
-      await dismissPopupsRounds(3, 800);
 
-      // Step 2: 注入视频文件
-      // ⚠️ 视频号上传按钮选择器待确认，需要人工提供 DOM
+      // Step 2: 向 iframe 内的隐藏 file input 注入文件
       await postJSON('/progress', { task_id, progress: 10, msg: '视频号：注入视频文件' });
       const setResult = await chrome.runtime.sendMessage({
-        type: 'setFileViaChooser',
+        type: 'setFileInput',
         filePath: task.file_path,
-        clickSelector: 'TODO_需要确认上传按钮选择器',
+        selector: 'input[type="file"]',
       });
       if (!setResult || !setResult.ok) throw new Error('视频注入失败: ' + (setResult?.error || '未知'));
 
-      // Step 3: 等待上传完成（标题输入框出现为信号）
-      // ⚠️ 标题 input 选择器待确认
+      // Step 3: 等待上传完成（在页面 JS 上下文检查 iframe 里的表单）
       await postJSON('/progress', { task_id, progress: 15, msg: '视频号：等待上传完成' });
       const uploadTimeout = 10 * 60 * 1000;
       const uploadStart = Date.now();
-      let titleVisible = false;
+      let editorVisible = false;
       while (Date.now() - uploadStart < uploadTimeout) {
         await sleep(2000);
-        dismissPopups();
-        // TODO: 替换为实际标题输入框选择器
-        const titleEl = document.querySelector('TODO_标题输入框选择器');
-        if (titleEl && titleEl.offsetParent) { titleVisible = true; break; }
+        const r = await runInPage(
+          `!!(document.querySelector('iframe') && document.querySelector('iframe').contentDocument && document.querySelector('iframe').contentDocument.querySelector('.post-desc-box .input-editor'))`
+        );
+        if (r && r.result === true) { editorVisible = true; break; }
       }
-      if (!titleVisible) throw new Error('等待上传完成超时');
+      if (!editorVisible) throw new Error('等待上传完成超时');
 
       await postJSON('/progress', { task_id, progress: 70, msg: '视频号：上传完成，填写信息' });
-      await sleep(2000);
-      await dismissPopupsRounds(3, 800);
+      await sleep(1500);
 
-      // Step 4: 填写标题
-      // ⚠️ 待确认选择器
-      if (meta && meta.title) {
-        const titleEl = document.querySelector('TODO_标题输入框选择器');
-        if (titleEl) {
-          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-          nativeSetter.call(titleEl, meta.title);
-          titleEl.dispatchEvent(new Event('input', { bubbles: true }));
-          titleEl.dispatchEvent(new Event('change', { bubbles: true }));
-        }
+      // Step 4: 填写标题 + 描述（在页面 JS 上下文操作 iframe DOM）
+      const title = meta?.title || '';
+      const desc = meta?.description || '';
+      const tags = meta?.tags || [];
+      let content = title;
+      if (title && desc) content += '\n\n';
+      content += desc;
+
+      if (content) {
+        await runInPage(`
+          (function() {
+            var el = document.querySelector('iframe').contentDocument.querySelector('.post-desc-box .input-editor');
+            if (!el) return;
+            el.focus();
+            document.querySelector('iframe').contentDocument.execCommand('selectAll', false, null);
+            document.querySelector('iframe').contentDocument.execCommand('delete', false, null);
+            document.querySelector('iframe').contentDocument.execCommand('insertText', false, ${JSON.stringify(content)});
+          })()
+        `);
+        await sleep(300);
       }
 
-      // Step 5: 填写描述/话题
-      // ⚠️ 待确认选择器
-      if (meta && (meta.description || meta.tags?.length)) {
-        const descEl = document.querySelector('TODO_描述输入框选择器');
-        if (descEl) {
-          descEl.focus();
-          await sleep(300);
-          document.execCommand('selectAll', false, null);
-          document.execCommand('delete', false, null);
-          if (meta.description) {
-            document.execCommand('insertText', false, meta.description);
-            await sleep(300);
+      // 插入话题标签
+      for (const tag of tags) {
+        await sleep(300);
+        await runInPage(`
+          document.querySelector('iframe').contentDocument.execCommand('insertText', false, ${JSON.stringify(' #' + tag)})
+        `);
+        await sleep(500);
+      }
+
+      await postJSON('/progress', { task_id, progress: 80, msg: '视频号：信息已填写' });
+
+      // Step 4.5: 上传封面图
+      if (meta?.cover_path) {
+        await postJSON('/progress', { task_id, progress: 80, msg: '视频号：准备上传封面' });
+
+        // 等待封面预览图完全加载（.edit-btn 可见，最多 90s）
+        let editBtnReady = false;
+        for (let i = 0; i < 45; i++) {
+          const check = await runInPage(`
+            (function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var doc = iframes[i].contentDocument;
+                  var editBtn = doc.querySelector('.edit-btn');
+                  if (editBtn && editBtn.offsetParent) return true;
+                } catch(e) {}
+              }
+              return false;
+            })()
+          `);
+          if (check?.result === true) { editBtnReady = true; break; }
+          await sleep(2000);
+        }
+        if (!editBtnReady) {
+          console.warn('[Auto Upload] 等待封面编辑按钮超时');
+        }
+        await sleep(3000);
+
+        // 上传封面的通用函数
+        async function uploadCover(editBtnSelector, label) {
+          // 点击"编辑"按钮
+          const editResult = await chrome.runtime.sendMessage({
+            type: 'cdpClickIframe',
+            selector: editBtnSelector,
+          });
+          console.log(`[Auto Upload] ${label}编辑按钮点击:`, JSON.stringify(editResult));
+          if (!editResult?.ok) return false;
+
+          // 等待编辑器弹窗打开 + .add-icon 可见
+          let addIconFound = false;
+          for (let i = 0; i < 5; i++) {
+            await sleep(1000);
+            const check = await runInPage(`
+              (function() {
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                  try {
+                    var doc = iframes[i].contentDocument;
+                    var dialog = doc.querySelector('.cover-set-footer');
+                    if (!dialog) continue;
+                    var els = doc.querySelectorAll('.add-icon');
+                    for (var j = 0; j < els.length; j++) {
+                      var r = els[j].getBoundingClientRect();
+                      if (r.width > 0 && r.height > 0) return { found: true };
+                    }
+                    return { found: false, dialogOpen: true };
+                  } catch(e) {}
+                }
+                return { found: false, dialogOpen: false };
+              })()
+            `);
+            if (check?.result?.found) { addIconFound = true; break; }
+            // 弹窗已打开但没有 .add-icon，无需继续等待
+            if (check?.result?.dialogOpen) break;
           }
-          // 话题插入逻辑待适配视频号
+
+          // 如果 .add-icon 未出现，可能需要先点击 .cover-tips 进入分享卡片编辑模式
+          if (!addIconFound) {
+            console.log(`[Auto Upload] ${label} 尝试点击 .cover-tips 进入编辑模式`);
+            await chrome.runtime.sendMessage({
+              type: 'cdpClickIframe',
+              selector: '.cover-tips',
+            });
+            await sleep(3000);
+            // 再次等待 .add-icon（最多 10s）
+            for (let i = 0; i < 10; i++) {
+              await sleep(1000);
+              const check = await runInPage(`
+                (function() {
+                  var iframes = document.querySelectorAll('iframe');
+                  for (var i = 0; i < iframes.length; i++) {
+                    try {
+                      var els = iframes[i].contentDocument.querySelectorAll('.add-icon');
+                      for (var j = 0; j < els.length; j++) {
+                        var r = els[j].getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true;
+                      }
+                    } catch(e) {}
+                  }
+                  return false;
+                })()
+              `);
+              if (check?.result === true) { addIconFound = true; break; }
+            }
+          }
+
+          // 点击添加图标，触发文件选择对话框
+          const coverResult = await chrome.runtime.sendMessage({
+            type: 'setFileViaChooser',
+            filePath: meta.cover_path,
+            clickSelector: '.add-icon',
+          });
+          if (!coverResult?.ok) {
+            console.warn(`[Auto Upload] ${label}封面上传失败:`, coverResult?.error);
+            return false;
+          }
+
+          await sleep(3000);
+
+          // 点击确认按钮
+          await runInPage(`
+            (function() {
+              var btn = null;
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  btn = iframes[i].contentDocument.querySelector('.cover-set-footer .weui-desktop-btn_primary');
+                  if (btn) break;
+                } catch(e) {}
+              }
+              if (!btn) btn = document.querySelector('.cover-set-footer .weui-desktop-btn_primary');
+              if (btn) btn.click();
+            })()
+          `);
+          await sleep(2000);
+          return true;
+        }
+
+        // 上传个人卡片封面
+        await uploadCover('.vertical-img-wrap .edit-btn', '个人卡片');
+        await postJSON('/progress', { task_id, progress: 83, msg: '视频号：个人卡片封面已上传' });
+
+        // 上传分享卡片封面（横屏视频才有 .horizon-img-wrap）
+        const hasHorizon = await runInPage(`
+          (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var el = iframes[i].contentDocument.querySelector('.horizon-img-wrap .edit-btn');
+                if (el && el.offsetParent) return true;
+              } catch(e) {}
+            }
+            return false;
+          })()
+        `);
+        if (hasHorizon?.result === true) {
+          // Step 1: 点击分享卡片编辑按钮
+          await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.horizon-img-wrap .edit-btn' });
+          await sleep(2000);
+
+          // Step 2: 点击"分享卡片"文字
+          await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.cover-tips' });
+          await sleep(1500);
+
+          // Step 3: 点击"使用素材"按钮
+          await runInPage(`
+            (function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var btns = iframes[i].contentDocument.querySelectorAll('.weui-desktop-btn_primary');
+                  for (var j = 0; j < btns.length; j++) {
+                    if (btns[j].textContent.trim() === '使用素材') { btns[j].click(); return; }
+                  }
+                } catch(e) {}
+              }
+            })()
+          `);
+          await sleep(2000);
+
+          // Step 4: 在裁剪器中拖动图片到顶部
+          // 图片默认居中，需要往下拖让顶部显示在视口中
+          const dragResult = await runInPage(`
+            (function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var vp = iframes[i].contentDocument.querySelector('.cr-viewport');
+                  if (!vp) continue;
+                  var img = iframes[i].contentDocument.querySelector('.cr-image');
+                  if (!img) continue;
+                  var vpRect = vp.getBoundingClientRect();
+                  var imgRect = img.getBoundingClientRect();
+                  var frRect = iframes[i].getBoundingClientRect();
+                  return {
+                    found: true,
+                    // 视口和图片的绝对坐标
+                    vpCx: frRect.left + vpRect.left + vpRect.width / 2,
+                    vpCy: frRect.top + vpRect.top + vpRect.height / 2,
+                    // 需要拖动的距离：图片顶部对齐视口顶部
+                    dragY: vpRect.top - imgRect.top
+                  };
+                } catch(e) {}
+              }
+              return { found: false };
+            })()
+          `);
+          console.log('[Auto Upload] 分享卡片裁剪器:', JSON.stringify(dragResult));
+
+          if (dragResult?.result?.found && dragResult.result.dragY > 0) {
+            const { vpCx, vpCy, dragY } = dragResult.result;
+            // 用 CDP 模拟拖拽：从视口中心往下拖 dragY 像素
+            await chrome.runtime.sendMessage({
+              type: 'cdpDrag',
+              startX: vpCx,
+              startY: vpCy,
+              endX: vpCx,
+              endY: vpCy + dragY,
+            });
+            await sleep(1000);
+          }
+
+          // Step 5: 点击确认
+          await runInPage(`
+            (function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var btns = iframes[i].contentDocument.querySelectorAll('.weui-desktop-btn_primary');
+                  for (var j = btns.length - 1; j >= 0; j--) {
+                    if (btns[j].offsetParent && btns[j].textContent.trim().match(/确认|完成|保存/)) {
+                      btns[j].click(); return;
+                    }
+                  }
+                } catch(e) {}
+              }
+            })()
+          `);
+          await sleep(2000);
+          await postJSON('/progress', { task_id, progress: 85, msg: '视频号：分享卡片封面已上传' });
+        } else {
+          await postJSON('/progress', { task_id, progress: 85, msg: '视频号：封面已上传（无分享卡片）' });
         }
       }
 
-      await postJSON('/progress', { task_id, progress: 85, msg: '视频号：信息已填写' });
+      // Step 5: 定时发布（可选）
+      if (meta?.publish_time) {
+        await postJSON('/progress', { task_id, progress: 86, msg: '视频号：设置定时发布' });
 
-      // Step 6: 点击发布
-      // ⚠️ 待确认发布按钮选择器
-      const publishBtn = Array.from(document.querySelectorAll('button')).find(btn => {
-        if (!btn.offsetParent) return false;
-        const t = (btn.innerText || '').trim();
-        return t === '发表' || t === '发布' || t === '发送';
-      });
-      if (!publishBtn) throw new Error('未找到发布按钮');
-      publishBtn.click();
+        const [datePart, timePart] = meta.publish_time.split(' ');
+        const [, , targetDay] = datePart.split('-');
+        const [targetHour, targetMin] = timePart.split(':');
+        const dayNum = String(parseInt(targetDay, 10));
+        const hourStr = String(parseInt(targetHour, 10)).padStart(2, '0');
+        const minStr = String(parseInt(targetMin, 10)).padStart(2, '0');
 
-      await postJSON('/progress', { task_id, progress: 90, msg: '视频号：已点击发布' });
-      await dismissPopupsRounds(5, 1000);
+        // 点击"定时发布"单选按钮
+        await runInPage(`
+          var r = document.querySelector('iframe').contentDocument.querySelector('.weui-desktop-form__radio[value="1"]');
+          if (r) r.click();
+        `);
+        await sleep(1000);
+
+        // 点击日期输入框打开日期选择器
+        await chrome.runtime.sendMessage({
+          type: 'cdpClickIframe',
+          selector: '.weui-desktop-form__input[placeholder="请选择发表时间"]',
+        });
+        await sleep(1000);
+
+        // 选择日期
+        await runInPage(`
+          (function() {
+            var doc = document.querySelector('iframe').contentDocument;
+            var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+            for (var i = 0; i < links.length; i++) {
+              var a = links[i];
+              if (a.classList.contains('weui-desktop-picker__disabled')) continue;
+              if (a.classList.contains('weui-desktop-picker__faded')) continue;
+              if (a.textContent.trim() === ${JSON.stringify(dayNum)}) {
+                a.click();
+                break;
+              }
+            }
+          })()
+        `);
+        await sleep(500);
+
+        // 点击时间区域展开时间面板
+        await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-picker__dt' });
+        await sleep(1000);
+
+        // 选择小时：滚动到目标并模拟完整鼠标事件
+        await runInPage(`
+          (function() {
+            var doc = document.querySelector('iframe').contentDocument;
+            var hours = doc.querySelectorAll('.weui-desktop-picker__time__hour li');
+            for (var i = 0; i < hours.length; i++) {
+              if (hours[i].classList.contains('weui-desktop-picker__disabled')) continue;
+              if (hours[i].textContent.trim() === ${JSON.stringify(hourStr)}) {
+                hours[i].scrollIntoView({ block: 'center' });
+                hours[i].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                hours[i].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                hours[i].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                break;
+              }
+            }
+          })()
+        `);
+        await sleep(500);
+
+        // 选择分钟
+        await runInPage(`
+          (function() {
+            var doc = document.querySelector('iframe').contentDocument;
+            var mins = doc.querySelectorAll('.weui-desktop-picker__time__minute li');
+            for (var i = 0; i < mins.length; i++) {
+              if (mins[i].classList.contains('weui-desktop-picker__disabled')) continue;
+              if (mins[i].textContent.trim() === ${JSON.stringify(minStr)}) {
+                mins[i].scrollIntoView({ block: 'center' });
+                mins[i].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                mins[i].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                mins[i].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                break;
+              }
+            }
+          })()
+        `);
+        await sleep(500);
+
+        // 关闭弹窗
+        await runInPage(`
+          (function() {
+            var doc = document.querySelector('iframe').contentDocument;
+            var body = doc.querySelector('.form-btns') || doc.body;
+            if (body) body.click();
+          })()
+        `);
+        await sleep(500);
+
+        await postJSON('/progress', { task_id, progress: 88, msg: '视频号：定时发布已设置 ' + meta.publish_time });
+      }
+
+      // Step 6: 点击发表
+      await sleep(500);
+      const publishResult = await runInPage(`
+        (function() {
+          var btn = document.querySelector('iframe').contentDocument.querySelector('.form-btns button.weui-desktop-btn_primary');
+          if (!btn) return false;
+          btn.click();
+          return true;
+        })()
+      `);
+      if (!publishResult || !publishResult.result) throw new Error('未找到发表按钮');
+
+      await postJSON('/progress', { task_id, progress: 90, msg: '视频号：已点击发表' });
+      await sleep(3000);
 
       const postUrl = location.href;
       navigator.sendBeacon(BASE_URL + '/done', JSON.stringify({ task_id, post_url: postUrl }));
@@ -739,6 +1129,12 @@
         if (loginResp.ok) {
           const loginReq = await loginResp.json();
           if (loginReq && loginReq.account_id) {
+            // 如果请求指定了平台但当前页面不是该平台，把请求放回再跳过
+            const myPlatform = getPlatform();
+            if (loginReq.platform && loginReq.platform !== myPlatform) {
+              await postJSON('/restore_login_request', loginReq);
+              continue;
+            }
             _running = true;
             try {
               await checkAndHandleLogin(loginReq.account_id);
@@ -757,6 +1153,12 @@
         if (!resp.ok) continue;
         const task = await resp.json();
         if (task && task.task_id) {
+          // 如果任务指定了平台但当前页面不是该平台，放回再跳过
+          const myPlatform = getPlatform();
+          if (task.platform && task.platform !== myPlatform) {
+            await postJSON('/restore_task', task);
+            continue;
+          }
           _running = true;
           try {
             await runTask(task);
@@ -769,6 +1171,9 @@
       }
     }
   }
+
+  // 非顶层 frame 不运行 poll loop（避免 iframe 重复轮询）
+  if (!IS_TOP_FRAME) return;
 
   // 检测跨页面登录：扫码后页面跳转，新页面的 content.js 在此上报 confirmed
   (async () => {

@@ -6,9 +6,22 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 from tools import login, check_login, upload_video, get_task_status
 
-PLATFORM   = "xiaohongshu"
+SUPPORTED_PLATFORMS = {
+    "1": "xiaohongshu",
+    "2": "channels",
+    "3": "douyin",
+}
+
+print("选择测试平台:")
+print("  1. 小红书 (xiaohongshu)")
+print("  2. 视频号 (channels)")
+print("  3. 抖音   (douyin)")
+choice = input("请输入序号 [1/2/3，默认 1]: ").strip() or "1"
+PLATFORM = SUPPORTED_PLATFORMS.get(choice, "xiaohongshu")
+print(f"已选择平台: {PLATFORM}\n")
+
 ACCOUNT_ID = "test"
-VIDEO_PATH = "/Users/zeoooo/Downloads/测试视频.mp4"
+VIDEO_PATH = "test_video.mp4"  # 替换为你的视频路径
 
 # 1. 检查登录
 print("=== 检查登录状态 ===")
@@ -45,9 +58,9 @@ r = upload_video(
         "title": "测试上传 " + time.strftime("%H:%M:%S"),
         "description": "自动化测试",
         "tags": ["测试", "自动化", "上传"],
-        "cover_path": "/Users/zeoooo/Downloads/测试封面.png",
+        "cover_path": "test_cover.png",  # 替换为你的封面路径
         "cover_ratio": "3:4",
-        "publish_time": "2026-03-16 08:00",
+        # "publish_time": "2026-03-16 20:00",  # 取消注释启用定时发布
     },
 )
 print("任务提交:", r)

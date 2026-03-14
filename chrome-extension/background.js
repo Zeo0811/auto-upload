@@ -31,7 +31,9 @@ async function getViewportCenter(tabId, nodeId) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
-  // ── setFileInput: 向 DOM 中已存在的 file input 直接注入文件 ──────────────
+  // ── setFileInput: 向 DOM 中已存在的 file input 直接注入文件（支持 iframe）──
+  // 用 Runtime.evaluate 拿到元素的 objectId，再用 DOM.setFileInputFiles(objectId) 注入
+  // 这样完全绕开跨 iframe 的 nodeId 问题
   if (msg.type === 'setFileInput') {
     const tabId = sender.tab.id;
     const filePath = msg.filePath;
@@ -40,17 +42,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         await attachDebugger(tabId);
-        const { root } = await sendCommand(tabId, 'DOM.getDocument', { depth: 1 });
-        let { nodeId } = await sendCommand(tabId, 'DOM.querySelector', {
-          nodeId: root.nodeId, selector,
+        const expr = `(function(sel) {
+          var el = document.querySelector(sel);
+          if (el) return el;
+          var frames = document.querySelectorAll('iframe');
+          for (var i = 0; i < frames.length; i++) {
+            try {
+              el = frames[i].contentDocument && frames[i].contentDocument.querySelector(sel);
+              if (el) return el;
+            } catch(e) {}
+          }
+          return null;
+        })(${JSON.stringify(selector)})`;
+        const { result: obj } = await sendCommand(tabId, 'Runtime.evaluate', {
+          expression: expr, returnByValue: false,
         });
-        if (!nodeId) {
-          ({ nodeId } = await sendCommand(tabId, 'DOM.querySelector', {
-            nodeId: root.nodeId, selector: 'input[type="file"]',
-          }));
-        }
-        if (!nodeId) throw new Error('找不到 input[type=file]');
-        await sendCommand(tabId, 'DOM.setFileInputFiles', { nodeId, files: [filePath] });
+        if (!obj || !obj.objectId) throw new Error('找不到元素: ' + selector);
+        // DOM.setFileInputFiles 支持直接传 objectId，无需 nodeId
+        await sendCommand(tabId, 'DOM.setFileInputFiles', { objectId: obj.objectId, files: [filePath] });
         await new Promise(res => chrome.debugger.detach({ tabId }, res));
         sendResponse({ ok: true });
       } catch (e) {
@@ -174,26 +183,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             reject(new Error('等待文件选择器超时(6s)'));
           }, 6000);
 
-          function handler(source, method) {
+          function handler(source, method, params) {
             if (source.tabId !== tabId) return;
             if (method === 'Page.fileChooserOpened') {
               clearTimeout(timer);
               chrome.debugger.onEvent.removeListener(handler);
-              resolve();
+              resolve(params);  // params 包含 backendNodeId
             }
           }
           chrome.debugger.onEvent.addListener(handler);
         });
 
-        // 用 Input.dispatchMouseEvent 模拟真实点击（比 element.click() 更可靠）
-        const { root } = await sendCommand(tabId, 'DOM.getDocument', { depth: 1 });
-        const { nodeId } = await sendCommand(tabId, 'DOM.querySelector', {
-          nodeId: root.nodeId,
-          selector: clickSelector,
+        // 用 Runtime.evaluate 在主文档及同源 iframe 中找可见元素并计算视口坐标
+        // 再用 Input.dispatchMouseEvent 模拟真实点击（支持 iframe 内元素）
+        const { result: coordResult } = await sendCommand(tabId, 'Runtime.evaluate', {
+          expression: `(function(sel) {
+            function findEl(doc, offsetX, offsetY) {
+              var els = doc.querySelectorAll(sel);
+              for (var j = 0; j < els.length; j++) {
+                var r = els[j].getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                  return { x: r.left + r.width / 2 + offsetX, y: r.top + r.height / 2 + offsetY };
+                }
+              }
+              return null;
+            }
+            var pos = findEl(document, 0, 0);
+            if (pos) return pos;
+            var frames = document.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+              try {
+                var fr = frames[i];
+                var fRect = fr.getBoundingClientRect();
+                pos = findEl(fr.contentDocument, fRect.left, fRect.top);
+                if (pos) return pos;
+              } catch(e) {}
+            }
+            return null;
+          })(${JSON.stringify(clickSelector)})`,
+          returnByValue: true,
         });
-        if (!nodeId) throw new Error(`找不到元素: ${clickSelector}`);
-
-        const { cx, cy } = await getViewportCenter(tabId, nodeId);
+        if (!coordResult || !coordResult.value) throw new Error(`找不到元素: ${clickSelector}`);
+        const { x: cx, y: cy } = coordResult.value;
 
         await sendCommand(tabId, 'Input.dispatchMouseEvent', {
           type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1,
@@ -202,13 +233,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1,
         });
 
-        // 等文件选择器打开
-        await fileChooserOpened;
+        // 等文件选择器打开，拿到 backendNodeId
+        const chooserParams = await fileChooserOpened;
 
-        // 提供文件
-        await sendCommand(tabId, 'Page.handleFileChooserDialog', {
-          action: 'accept',
+        // 用 DOM.setFileInputFiles 直接注入文件（通过 backendNodeId）
+        await sendCommand(tabId, 'DOM.setFileInputFiles', {
           files: [filePath],
+          backendNodeId: chooserParams.backendNodeId,
         });
 
         await sendCommand(tabId, 'Page.setInterceptFileChooserDialog', { enabled: false });
@@ -216,6 +247,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } catch (e) {
         try { await sendCommand(tabId, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch (_) {}
+        chrome.debugger.detach({ tabId }, () => {});
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── runInPage: 在页面 JS 上下文执行表达式（可访问 iframe.contentDocument）──
+  if (msg.type === 'runInPage') {
+    const tabId = sender.tab.id;
+    const { expression } = msg;
+    (async () => {
+      try {
+        await attachDebugger(tabId);
+        const { result, exceptionDetails } = await sendCommand(tabId, 'Runtime.evaluate', {
+          expression,
+          returnByValue: true,
+          awaitPromise: false,
+        });
+        await new Promise(res => chrome.debugger.detach({ tabId }, res));
+        if (exceptionDetails) {
+          sendResponse({ ok: false, error: exceptionDetails.text || 'JS exception' });
+        } else {
+          sendResponse({ ok: true, result: result?.value });
+        }
+      } catch (e) {
         chrome.debugger.detach({ tabId }, () => {});
         sendResponse({ ok: false, error: e.message });
       }
@@ -242,6 +299,92 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await sendCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 });
         await new Promise(res => chrome.debugger.detach({ tabId }, res));
         sendResponse({ ok: true, x: cx, y: cy });
+      } catch (e) {
+        chrome.debugger.detach({ tabId }, () => {});
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── cdpClickIframe: 用 CDP 真实点击 iframe 内的元素 ─────────────────────
+  if (msg.type === 'cdpClickIframe') {
+    const tabId = sender.tab.id;
+    const { selector } = msg;
+
+    (async () => {
+      try {
+        await attachDebugger(tabId);
+        const { result: coordResult } = await sendCommand(tabId, 'Runtime.evaluate', {
+          expression: `(function(sel) {
+            function findEl(doc, offsetX, offsetY) {
+              var els = doc.querySelectorAll(sel);
+              for (var j = 0; j < els.length; j++) {
+                var r = els[j].getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                  return { x: r.left + r.width / 2 + offsetX, y: r.top + r.height / 2 + offsetY };
+                }
+              }
+              return null;
+            }
+            var pos = findEl(document, 0, 0);
+            if (pos) return pos;
+            var frames = document.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+              try {
+                var fr = frames[i];
+                var fRect = fr.getBoundingClientRect();
+                pos = findEl(fr.contentDocument, fRect.left, fRect.top);
+                if (pos) return pos;
+              } catch(e) {}
+            }
+            return null;
+          })(${JSON.stringify(selector)})`,
+          returnByValue: true,
+        });
+        if (!coordResult || !coordResult.value) throw new Error(`找不到可见元素: ${selector}`);
+        const { x: cx, y: cy } = coordResult.value;
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy });
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 });
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 });
+        await new Promise(res => chrome.debugger.detach({ tabId }, res));
+        sendResponse({ ok: true, x: cx, y: cy });
+      } catch (e) {
+        chrome.debugger.detach({ tabId }, () => {});
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── cdpDrag: 用 CDP 模拟拖拽 ─────────────────────────────────────────────
+  if (msg.type === 'cdpDrag') {
+    const tabId = sender.tab.id;
+    const { startX, startY, endX, endY } = msg;
+
+    (async () => {
+      try {
+        await attachDebugger(tabId);
+        // mousedown
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mousePressed', x: startX, y: startY, button: 'left', clickCount: 1,
+        });
+        // 分步 mousemove（平滑拖拽）
+        const steps = 10;
+        for (let i = 1; i <= steps; i++) {
+          const x = startX + (endX - startX) * i / steps;
+          const y = startY + (endY - startY) * i / steps;
+          await sendCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x, y, button: 'left',
+          });
+          await new Promise(r => setTimeout(r, 30));
+        }
+        // mouseup
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mouseReleased', x: endX, y: endY, button: 'left', clickCount: 1,
+        });
+        await new Promise(res => chrome.debugger.detach({ tabId }, res));
+        sendResponse({ ok: true });
       } catch (e) {
         chrome.debugger.detach({ tabId }, () => {});
         sendResponse({ ok: false, error: e.message });
@@ -335,6 +478,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         await new Promise(res => chrome.debugger.detach({ tabId }, res));
         sendResponse({ ok: true });
+      } catch (e) {
+        chrome.debugger.detach({ tabId }, () => {});
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── captureScreenshot: CDP 截图，自动遍历所有帧找 .qrcode-area 裁剪 ───────
+  if (msg.type === 'captureScreenshot') {
+    const tabId = sender.tab.id;
+    (async () => {
+      try {
+        await attachDebugger(tabId);
+        await sendCommand(tabId, 'Page.enable', {});
+
+        // clip 由 content.js 提供（主帧坐标），直接使用
+        let clip;
+        if (msg.clip) {
+          const { x, y, width, height } = msg.clip;
+          if (width > 0 && height > 0) clip = { x, y, width, height, scale: 1 };
+        }
+
+        const screenshotParams = { format: 'png' };
+        if (clip) screenshotParams.clip = clip;
+        const result = await sendCommand(tabId, 'Page.captureScreenshot', screenshotParams);
+        await new Promise(res => chrome.debugger.detach({ tabId }, res));
+        sendResponse({ ok: true, dataUrl: 'data:image/png;base64,' + result.data });
       } catch (e) {
         chrome.debugger.detach({ tabId }, () => {});
         sendResponse({ ok: false, error: e.message });

@@ -182,6 +182,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
 
+        # POST /restore_task — 插件将不匹配平台的任务放回队列
+        if path == "/restore_task":
+            with _pending_task_lock:
+                global _pending_task
+                if _pending_task is None:
+                    _pending_task = body
+            self._json({"ok": True})
+            return
+
+        # POST /restore_login_request — 插件将不匹配平台的请求放回队列
+        if path == "/restore_login_request":
+            with _login_request_lock:
+                global _login_request
+                if _login_request is None:   # 只有队列为空时才放回，避免覆盖新请求
+                    _login_request = body
+            self._json({"ok": True})
+            return
+
         # POST /login_status
         if path == "/login_status":
             account_id = body.get("account_id", "")
@@ -190,19 +208,28 @@ class _Handler(BaseHTTPRequestHandler):
                 state: dict = {"status": status}
                 if status == "qr_required":
                     qr_base64 = body.get("qr_base64", "")
+                    qr_url = body.get("qr_url", "")
+                    qr_dir = BASE_DIR / "tmp"
+                    qr_dir.mkdir(exist_ok=True)
+                    qr_path = str(qr_dir / f"qr_{account_id}.png")
+                    saved = False
                     if qr_base64:
                         try:
-                            # 去掉 data:image/png;base64, 前缀
                             if "," in qr_base64:
                                 qr_base64 = qr_base64.split(",", 1)[1]
-                            qr_dir = BASE_DIR / "tmp"
-                            qr_dir.mkdir(exist_ok=True)
-                            qr_path = str(qr_dir / f"xhs_qr_{account_id}.png")
                             with open(qr_path, "wb") as f:
                                 f.write(base64.b64decode(qr_base64))
-                            state["qr_path"] = qr_path
+                            saved = True
                         except Exception:
-                            state["qr_path"] = ""
+                            pass
+                    if not saved and qr_url:
+                        try:
+                            import urllib.request
+                            urllib.request.urlretrieve(qr_url, qr_path)
+                            saved = True
+                        except Exception:
+                            pass
+                    state["qr_path"] = qr_path if saved else ""
                 elif "error" in body:
                     state["error"] = body.get("error", "")
                 with _login_state_lock:
@@ -235,7 +262,7 @@ def start_server(port: int = 7788):
         _server_started = True
 
 
-def post_task(task_id: str, file_path: str, meta: dict):
+def post_task(task_id: str, file_path: str, meta: dict, platform: str = ''):
     """发布一个待处理任务"""
     _file_cache[task_id] = file_path
     with _pending_task_lock:
@@ -244,6 +271,7 @@ def post_task(task_id: str, file_path: str, meta: dict):
             "task_id": task_id,
             "file_path": file_path,
             "meta": meta,
+            "platform": platform,
         }
     with _progress_lock:
         _progress[task_id] = {"progress": 0, "msg": "等待插件领取任务"}
@@ -251,11 +279,11 @@ def post_task(task_id: str, file_path: str, meta: dict):
         _results.pop(task_id, None)
 
 
-def set_login_request(account_id: str):
+def set_login_request(account_id: str, platform: str = ''):
     """Python 触发一次登录检测"""
     global _login_request
     with _login_request_lock:
-        _login_request = {"account_id": account_id}
+        _login_request = {"account_id": account_id, "platform": platform}
 
 
 def get_login_state(account_id: str) -> dict:

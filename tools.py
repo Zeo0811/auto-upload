@@ -1,6 +1,6 @@
 """
 Auto Upload — Agent 调用的唯一入口。
-支持平台：小红书、抖音、视频号等。
+支持平台：xiaohongshu（小红书）、channels（视频号）、douyin（抖音）。
 所有函数均为同步，返回 dict，结构固定，Agent 可直接解析。
 """
 import asyncio
@@ -10,7 +10,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.session import load_session
+from core.session import load_session, save_session
 from core.task_runner import create_task, update_task, get_task, run_task_in_background
 from config import TMP_DIR
 
@@ -38,7 +38,7 @@ def login(platform: str, account_id: str) -> dict:
 
     start_server()
     clear_login_state(account_id)
-    set_login_request(account_id)
+    set_login_request(account_id, platform)
 
     # 打开 Chrome 到 XHS 创作页
     from config import PLATFORM_URLS
@@ -54,6 +54,7 @@ def login(platform: str, account_id: str) -> dict:
             continue
         status = state.get('status')
         if status == 'ok':
+            save_session(platform, account_id, {'logged_in': True})
             return {'status': 'ok'}
         if status == 'qr_required':
             qr_path = state.get('qr_path', '')
@@ -85,8 +86,10 @@ def check_login(platform: str, account_id: str) -> dict:
         return {'status': 'pending'}
     status = state.get('status')
     if status == 'confirmed':
+        save_session(platform, account_id, {'logged_in': True})
         return {'status': 'confirmed'}
     if status == 'ok':
+        save_session(platform, account_id, {'logged_in': True})
         return {'status': 'confirmed'}
     if status == 'error':
         return {'status': 'error', 'error': state.get('error', '')}
@@ -136,7 +139,7 @@ def upload_video(
             from core.local_server import start_server, post_task, get_result, get_progress
             import subprocess
             start_server()
-            post_task(task_id, str(video_path), meta)
+            post_task(task_id, str(video_path), meta, platform)
 
             # 先等 10 秒，如果插件已在运行的标签页里自动领取了任务就不用再开 Chrome
             for _ in range(10):
@@ -145,9 +148,10 @@ def upload_video(
                     break
             else:
                 # 没有标签页在运行，打开 Chrome
+                from config import PLATFORM_URLS
+                open_url = PLATFORM_URLS.get(platform, "https://creator.xiaohongshu.com/publish/publish")
                 subprocess.run(
-                    ["open", "-a", "Google Chrome",
-                     "https://creator.xiaohongshu.com/publish/publish"],
+                    ["open", "-a", "Google Chrome", open_url],
                     capture_output=True
                 )
 
