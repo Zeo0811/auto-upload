@@ -361,21 +361,35 @@
           await chrome.runtime.sendMessage({ type: 'cdpClick', selector: '.ratio-select' });
           await sleep(1000);
 
-          // 标准化比例文字（全角冒号/空格）
-          const normRatio = r => r.trim().replace(/：/g, ':').replace(/\s+/g, '');
-          const target = normRatio(targetRatio);
+          // 将 "W:H" 或 "W：H" 解析为小数，无法解析返回 null
+          const parseRatio = str => {
+            const m = str.trim().replace(/：/g, ':').replace(/\s+/g, '').match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/);
+            if (!m) return null;
+            const h = parseFloat(m[2]);
+            return h === 0 ? null : parseFloat(m[1]) / h;
+          };
+          const targetVal = parseRatio(targetRatio);
 
-          // 等待并查找目标比例选项（最多 3s）
+          // 等待比例选项出现（最多 3s），收集所有候选后选最近的
           let option = null;
           for (let i = 0; i < 6; i++) {
-            const allEls = Array.from(document.querySelectorAll('li, div, span, button'));
-            // 叶节点精确匹配
-            option = allEls.find(el => el.children.length === 0 && normRatio(el.innerText || el.textContent || '') === target);
-            // 任意节点精确匹配（处理文字被子元素包裹的情况）
-            if (!option) {
-              option = allEls.find(el => normRatio(el.innerText || el.textContent || '') === target);
+            const allEls = Array.from(document.querySelectorAll('li, div, span, button'))
+              .filter(el => el.children.length === 0); // 只看叶节点
+            const candidates = allEls
+              .map(el => ({ el, val: parseRatio(el.innerText || el.textContent || '') }))
+              .filter(c => c.val !== null);
+            if (candidates.length > 0) {
+              if (targetVal !== null) {
+                // 按与目标比值的差值排序，取最近的
+                candidates.sort((a, b) => Math.abs(a.val - targetVal) - Math.abs(b.val - targetVal));
+                option = candidates[0].el;
+              } else {
+                // 目标无法解析时退回精确文字匹配
+                const norm = r => r.trim().replace(/：/g, ':').replace(/\s+/g, '');
+                option = allEls.find(el => norm(el.innerText || el.textContent || '') === norm(targetRatio));
+              }
+              if (option) break;
             }
-            if (option) break;
             await sleep(500);
           }
           if (option) {
