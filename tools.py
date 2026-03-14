@@ -1,49 +1,18 @@
 """
-Agent 调用的唯一入口。
+Auto Upload — Agent 调用的唯一入口。
+支持平台：小红书、抖音、视频号等。
 所有函数均为同步，返回 dict，结构固定，Agent 可直接解析。
 """
 import asyncio
-import os
 import sys
+import os
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.browser import new_context, close_browser
-from core.session import load_session, save_session, delete_session
+from core.session import load_session
 from core.task_runner import create_task, update_task, get_task, run_task_in_background
 from config import TMP_DIR
-
-# 平台映射
-_PLATFORM_MAP = {
-    "xiaohongshu": "platforms.xiaohongshu.XiaohongshuPlatform",
-}
-
-# 登录中的 context 缓存 {platform_account_id: BrowserContext}
-_login_contexts: dict[str, object] = {}
-
-
-def _get_platform_class(platform: str):
-    import importlib
-    if platform not in _PLATFORM_MAP:
-        raise ValueError(f"不支持的平台: {platform}，可选: {list(_PLATFORM_MAP.keys())}")
-    module_path, class_name = _PLATFORM_MAP[platform].rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
-
-
-def _run(coro):
-    """在当前线程运行协程，兼容已有事件循环的情况"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
 
 
 # ====================================================================== #
@@ -64,34 +33,37 @@ def login(platform: str, account_id: str) -> dict:
 
       {"status": "error", "error": "..."}
     """
-    key = f"{platform}_{account_id}"
+    import subprocess
+    from core.local_server import start_server, set_login_request, get_login_state, clear_login_state
 
-    async def _do():
-        PlatformClass = _get_platform_class(platform)
-        storage_state = load_session(platform, account_id)
-        context = await new_context(storage_state)
-        instance = PlatformClass(context, account_id)
+    start_server()
+    clear_login_state(account_id)
+    set_login_request(account_id)
 
-        if await instance.is_logged_in():
-            # 刷新保存 Cookie
-            state = await context.storage_state()
-            save_session(platform, account_id, state)
-            await context.close()
-            return {"status": "ok"}
+    # 打开 Chrome 到 XHS 创作页
+    from config import PLATFORM_URLS
+    url = PLATFORM_URLS.get(platform, "https://creator.xiaohongshu.com/publish/publish")
+    subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
 
-        # 需要扫码登录
-        _login_contexts[key] = (context, instance)
-        qr_path = await instance.get_qr_code()
+    # 等插件报告登录状态（最多 30 秒）
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        time.sleep(1)
+        state = get_login_state(account_id)
+        if not state:
+            continue
+        status = state.get('status')
+        if status == 'ok':
+            return {'status': 'ok'}
+        if status == 'qr_required':
+            qr_path = state.get('qr_path', '')
+            if qr_path:
+                os.system(f"open '{qr_path}'")
+            return {'status': 'qr_required', 'qr_path': qr_path}
+        if status == 'error':
+            return {'status': 'error', 'error': state.get('error', '登录检测失败')}
 
-        # Mac 本地自动打开图片预览
-        os.system(f"open '{qr_path}'")
-
-        return {"status": "qr_required", "qr_path": qr_path}
-
-    try:
-        return _run(_do())
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    return {'status': 'error', 'error': '等待插件响应超时'}
 
 
 # ====================================================================== #
@@ -104,32 +76,21 @@ def check_login(platform: str, account_id: str) -> dict:
 
     返回:
       {"status": "pending"}   等待用户扫码
-      {"status": "scanned"}   已扫码，等待确认
       {"status": "confirmed"} 登录成功
-      {"status": "expired"}   二维码已过期，需重新调 login()
       {"status": "error", "error": "..."}
     """
-    key = f"{platform}_{account_id}"
-
-    async def _do():
-        if key not in _login_contexts:
-            return {"status": "error", "error": "没有进行中的登录流程，请先调用 login()"}
-
-        context, instance = _login_contexts[key]
-        status = await instance.check_qr_status()
-
-        if status == "confirmed":
-            state = await context.storage_state()
-            save_session(platform, account_id, state)
-            del _login_contexts[key]
-            await context.close()
-
-        return {"status": status}
-
-    try:
-        return _run(_do())
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    from core.local_server import get_login_state
+    state = get_login_state(account_id)
+    if not state:
+        return {'status': 'pending'}
+    status = state.get('status')
+    if status == 'confirmed':
+        return {'status': 'confirmed'}
+    if status == 'ok':
+        return {'status': 'confirmed'}
+    if status == 'error':
+        return {'status': 'error', 'error': state.get('error', '')}
+    return {'status': 'pending'}
 
 
 # ====================================================================== #
@@ -169,31 +130,47 @@ def upload_video(
     async def _run_upload():
         try:
             update_task(task_id, status="downloading", progress=5)
-
-            # 解析 source
             video_path = await _resolve_source(source, task_id)
+            update_task(task_id, status="uploading", progress=10)
 
-            update_task(task_id, status="uploading", progress=15)
+            from core.local_server import start_server, post_task, get_result, get_progress
+            import subprocess
+            start_server()
+            post_task(task_id, str(video_path), meta)
 
-            PlatformClass = _get_platform_class(platform)
-            context = await new_context(storage_state)
-            instance = PlatformClass(context, account_id)
+            # 先等 10 秒，如果插件已在运行的标签页里自动领取了任务就不用再开 Chrome
+            for _ in range(10):
+                await asyncio.sleep(1)
+                if get_progress(task_id).get('progress', 0) > 0:
+                    break
+            else:
+                # 没有标签页在运行，打开 Chrome
+                subprocess.run(
+                    ["open", "-a", "Google Chrome",
+                     "https://creator.xiaohongshu.com/publish/publish"],
+                    capture_output=True
+                )
 
-            def on_progress(pct, msg):
-                update_task(task_id, progress=pct, status_msg=msg)
+            timeout = 900
+            start = time.time()
+            while time.time() - start < timeout:
+                await asyncio.sleep(2)
+                prog = get_progress(task_id)
+                if prog.get('progress'):
+                    update_task(task_id, progress=prog['progress'],
+                                status_msg=prog.get('msg', ''))
+                result = get_result(task_id)
+                if result:
+                    if result['status'] == 'done':
+                        _cleanup_tmp(video_path, source)
+                        update_task(task_id, status="done", progress=100,
+                                    post_url=result.get('post_url'))
+                    else:
+                        update_task(task_id, status="failed",
+                                    error=result.get('error', 'Unknown'))
+                    return
 
-            post_url = await instance.upload(video_path, meta, on_progress=on_progress)
-
-            # 刷新 Cookie
-            state = await context.storage_state()
-            save_session(platform, account_id, state)
-            await context.close()
-
-            # 清理临时文件
-            _cleanup_tmp(video_path, source)
-
-            update_task(task_id, status="done", progress=100, post_url=post_url)
-
+            update_task(task_id, status="failed", error="上传超时(15分钟)")
         except Exception as e:
             update_task(task_id, status="failed", error=str(e))
 

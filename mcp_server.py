@@ -1,5 +1,6 @@
 """
 MCP Server 封装 — 让 Claude Code / 支持 MCP 的 Agent 直接调用 tools.py 里的函数。
+支持平台：小红书、抖音、视频号等。
 
 启动方式:
   python mcp_server.py
@@ -7,7 +8,7 @@ MCP Server 封装 — 让 Claude Code / 支持 MCP 的 Agent 直接调用 tools.
 在 Claude Code 的 ~/.claude.json 里添加:
   {
     "mcpServers": {
-      "social-video-uploader": {
+      "auto-upload": {
         "command": "python",
         "args": ["/Users/zeoooo/social-video-uploader/mcp_server.py"]
       }
@@ -21,14 +22,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from mcp.server.fastmcp import FastMCP
 import tools
 
-mcp = FastMCP("social-video-uploader")
+mcp = FastMCP("auto-upload")
 
 
 @mcp.tool()
 def login(platform: str, account_id: str) -> dict:
     """
     检查并发起登录。
-    platform: 平台名，目前支持 xiaohongshu
+    platform: 平台名，支持 xiaohongshu / douyin / channels
     account_id: 账号标识（自定义，用于区分多账号）
 
     返回 {"status": "ok"} 或 {"status": "qr_required", "qr_path": "..."}
