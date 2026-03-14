@@ -11,6 +11,7 @@ for d in [SESSIONS_DIR, TMP_DIR, TASKS_DIR]:
 
 PLATFORM_URLS = {
     "xiaohongshu": "https://creator.xiaohongshu.com/publish/publish",
-    "douyin": "https://creator.douyin.com/creator-micro/content/upload",
-    "bilibili": "https://member.bilibili.com/platform/upload/video/frame",
+    "channels":    "https://channels.weixin.qq.com/platform/post/create",
+    "douyin":      "https://creator.douyin.com/creator-micro/content/upload",
+    "bilibili":    "https://member.bilibili.com/platform/upload/video/frame",
 }

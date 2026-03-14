@@ -75,78 +75,139 @@
   // 登录检测与处理
   // -------------------------------------------------------------------------
 
+  const LOGIN_PENDING_KEY = '__au_login_pending';
+
   function isOnLoginPage() {
-    // URL 含 /login 或页面上有登录表单
-    if (location.pathname.includes('/login')) return true;
-    const container = document.querySelector('.login-container');
-    if (container && container.offsetParent) return true;
-    return false;
+    const platform = getPlatform();
+    if (platform === 'xiaohongshu') {
+      if (location.pathname.includes('/login')) return true;
+      const c = document.querySelector('.login-container');
+      return !!(c && c.offsetParent);
+    }
+    if (platform === 'channels') {
+      if (location.pathname.includes('/login')) return true;
+      return !!document.querySelector('.login-qrcode-wrap');
+    }
+    return location.pathname.includes('/login');
   }
 
   async function checkAndHandleLogin(accountId) {
     if (!isOnLoginPage()) {
-      // 已登录
       await postJSON('/login_status', { account_id: accountId, status: 'ok' });
       return true;
     }
+    const platform = getPlatform();
+    if (platform === 'channels') return checkAndHandleChannelsLogin(accountId);
+    return checkAndHandleXhsLogin(accountId);
+  }
 
-    // 需要登录，尝试切换到二维码模式
+  // 小红书登录
+  async function checkAndHandleXhsLogin(accountId) {
+    // 尝试切换到二维码模式
     const qrSwitchBtn = document.querySelector('.login-box-container img:first-child');
-    if (qrSwitchBtn) {
-      qrSwitchBtn.click();
-      await sleep(1500);
-    }
+    if (qrSwitchBtn) { qrSwitchBtn.click(); await sleep(1500); }
 
-    // XHS 二维码 src 本身就是 data:image/png;base64，取 src 最长的那张（QR 远大于小图标）
+    // 取 src 最长的 data:image（QR 远大于小图标）
     await sleep(2000);
     const allDataImgs = Array.from(document.querySelectorAll('img[src^="data:image"]'));
     const qrImg = allDataImgs.sort((a, b) => b.src.length - a.src.length)[0];
+    await postJSON('/login_status', {
+      account_id: accountId,
+      status: 'qr_required',
+      qr_base64: qrImg ? qrImg.src : '',
+    });
 
-    if (qrImg) {
-      await postJSON('/login_status', {
-        account_id: accountId,
-        status: 'qr_required',
-        qr_base64: qrImg.src,
-      });
-    } else {
-      await postJSON('/login_status', { account_id: accountId, status: 'qr_required', qr_base64: '' });
-    }
-
-    // 标记登录待确认，页面跳转后由新页面的 content.js 上报 confirmed
-    localStorage.setItem('__xhs_login_pending', accountId);
-
-    // 轮询等待登录完成（最多 3 分钟）
+    localStorage.setItem(LOGIN_PENDING_KEY, accountId);
     const deadline = Date.now() + 3 * 60 * 1000;
     while (Date.now() < deadline) {
       await sleep(2000);
       if (!isOnLoginPage()) {
-        localStorage.removeItem('__xhs_login_pending');
+        localStorage.removeItem(LOGIN_PENDING_KEY);
         await postJSON('/login_status', { account_id: accountId, status: 'confirmed' });
         return true;
       }
     }
+    localStorage.removeItem(LOGIN_PENDING_KEY);
+    await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'QR 超时' });
+    return false;
+  }
 
-    // 超时
-    localStorage.removeItem('__xhs_login_pending');
+  // 视频号登录
+  async function checkAndHandleChannelsLogin(accountId) {
+    await sleep(2000);
+
+    // 取 .qrcode img（精确选择器），src 是 data:image/png;base64
+    const qrImg = document.querySelector('.login-qrcode-wrap img.qrcode');
+    await postJSON('/login_status', {
+      account_id: accountId,
+      status: 'qr_required',
+      qr_base64: (qrImg && qrImg.src.startsWith('data:image')) ? qrImg.src : '',
+    });
+
+    localStorage.setItem(LOGIN_PENDING_KEY, accountId);
+    const deadline = Date.now() + 3 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await sleep(2000);
+
+      // 登录成功：离开了登录页
+      if (!isOnLoginPage()) {
+        localStorage.removeItem(LOGIN_PENDING_KEY);
+        await postJSON('/login_status', { account_id: accountId, status: 'confirmed' });
+        return true;
+      }
+
+      // 二维码过期：显示了"已过期"遮罩
+      const expired = Array.from(document.querySelectorAll('.qrcode-wrap .mask')).find(
+        m => m.offsetParent && (m.innerText || '').includes('已过期')
+      );
+      if (expired) {
+        localStorage.removeItem(LOGIN_PENDING_KEY);
+        await postJSON('/login_status', { account_id: accountId, status: 'error', error: '二维码已过期，请重新调用 login()' });
+        return false;
+      }
+    }
+
+    localStorage.removeItem(LOGIN_PENDING_KEY);
     await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'QR 超时' });
     return false;
   }
 
   // -------------------------------------------------------------------------
-  // 主任务流程
+  // 平台检测
+  // -------------------------------------------------------------------------
+
+  function getPlatform() {
+    const h = location.hostname;
+    if (h.includes('xiaohongshu.com')) return 'xiaohongshu';
+    if (h.includes('douyin.com'))      return 'douyin';
+    if (h.includes('weixin.qq.com'))   return 'channels';
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // 任务分发
   // -------------------------------------------------------------------------
 
   async function runTask(task) {
+    const platform = getPlatform();
+    console.log('[Auto Upload] 平台:', platform, '任务:', task.task_id);
+    if (platform === 'xiaohongshu') return runXhsTask(task);
+    if (platform === 'channels')    return runChannelsTask(task);
+    throw new Error('当前页面不是支持的平台: ' + location.hostname);
+  }
+
+  // -------------------------------------------------------------------------
+  // 小红书上传流程
+  // -------------------------------------------------------------------------
+
+  async function runXhsTask(task) {
     const { task_id, meta } = task;
     console.log('[Auto Upload] 开始处理任务', task_id);
 
     try {
       // 0. 检查是否已登录
-      const loginContainer = document.querySelector('.login-container');
-      if (loginContainer && loginContainer.offsetParent) {
-        // 未登录，先处理登录
+      if (isOnLoginPage()) {
         await checkAndHandleLogin('default');
-        // 等页面跳转稳定
         await sleep(3000);
       }
 
@@ -555,14 +616,108 @@
       const postUrl = location.href;
       navigator.sendBeacon(BASE_URL + '/done', JSON.stringify({ task_id, post_url: postUrl }));
       console.log('[Auto Upload] 任务完成', task_id);
-      // DEBUG: 不自动关闭，方便查看 Console 日志
-      // chrome.runtime.sendMessage({ type: 'closeTab' });
 
     } catch (e) {
       console.error('[Auto Upload] 任务失败', task_id, e);
       navigator.sendBeacon(BASE_URL + '/fail', JSON.stringify({ task_id, error: e.message || String(e) }));
-      // DEBUG: 不自动关闭
-      // chrome.runtime.sendMessage({ type: 'closeTab' });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 视频号上传流程
+  // -------------------------------------------------------------------------
+
+  async function runChannelsTask(task) {
+    const { task_id, meta } = task;
+    console.log('[Auto Upload] 视频号任务开始', task_id);
+
+    try {
+      await postJSON('/progress', { task_id, progress: 5, msg: '视频号：页面准备中' });
+
+      // Step 1: 等页面稳定，清弹窗
+      await sleep(2000);
+      await dismissPopupsRounds(3, 800);
+
+      // Step 2: 注入视频文件
+      // ⚠️ 视频号上传按钮选择器待确认，需要人工提供 DOM
+      await postJSON('/progress', { task_id, progress: 10, msg: '视频号：注入视频文件' });
+      const setResult = await chrome.runtime.sendMessage({
+        type: 'setFileViaChooser',
+        filePath: task.file_path,
+        clickSelector: 'TODO_需要确认上传按钮选择器',
+      });
+      if (!setResult || !setResult.ok) throw new Error('视频注入失败: ' + (setResult?.error || '未知'));
+
+      // Step 3: 等待上传完成（标题输入框出现为信号）
+      // ⚠️ 标题 input 选择器待确认
+      await postJSON('/progress', { task_id, progress: 15, msg: '视频号：等待上传完成' });
+      const uploadTimeout = 10 * 60 * 1000;
+      const uploadStart = Date.now();
+      let titleVisible = false;
+      while (Date.now() - uploadStart < uploadTimeout) {
+        await sleep(2000);
+        dismissPopups();
+        // TODO: 替换为实际标题输入框选择器
+        const titleEl = document.querySelector('TODO_标题输入框选择器');
+        if (titleEl && titleEl.offsetParent) { titleVisible = true; break; }
+      }
+      if (!titleVisible) throw new Error('等待上传完成超时');
+
+      await postJSON('/progress', { task_id, progress: 70, msg: '视频号：上传完成，填写信息' });
+      await sleep(2000);
+      await dismissPopupsRounds(3, 800);
+
+      // Step 4: 填写标题
+      // ⚠️ 待确认选择器
+      if (meta && meta.title) {
+        const titleEl = document.querySelector('TODO_标题输入框选择器');
+        if (titleEl) {
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          nativeSetter.call(titleEl, meta.title);
+          titleEl.dispatchEvent(new Event('input', { bubbles: true }));
+          titleEl.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+
+      // Step 5: 填写描述/话题
+      // ⚠️ 待确认选择器
+      if (meta && (meta.description || meta.tags?.length)) {
+        const descEl = document.querySelector('TODO_描述输入框选择器');
+        if (descEl) {
+          descEl.focus();
+          await sleep(300);
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          if (meta.description) {
+            document.execCommand('insertText', false, meta.description);
+            await sleep(300);
+          }
+          // 话题插入逻辑待适配视频号
+        }
+      }
+
+      await postJSON('/progress', { task_id, progress: 85, msg: '视频号：信息已填写' });
+
+      // Step 6: 点击发布
+      // ⚠️ 待确认发布按钮选择器
+      const publishBtn = Array.from(document.querySelectorAll('button')).find(btn => {
+        if (!btn.offsetParent) return false;
+        const t = (btn.innerText || '').trim();
+        return t === '发表' || t === '发布' || t === '发送';
+      });
+      if (!publishBtn) throw new Error('未找到发布按钮');
+      publishBtn.click();
+
+      await postJSON('/progress', { task_id, progress: 90, msg: '视频号：已点击发布' });
+      await dismissPopupsRounds(5, 1000);
+
+      const postUrl = location.href;
+      navigator.sendBeacon(BASE_URL + '/done', JSON.stringify({ task_id, post_url: postUrl }));
+      console.log('[Auto Upload] 视频号任务完成', task_id);
+
+    } catch (e) {
+      console.error('[Auto Upload] 视频号任务失败', task_id, e);
+      navigator.sendBeacon(BASE_URL + '/fail', JSON.stringify({ task_id, error: e.message || String(e) }));
     }
   }
 
@@ -615,11 +770,11 @@
     }
   }
 
-  // 检测跨页面登录：扫码后 XHS 跳转新页面，新 content.js 在此上报 confirmed
+  // 检测跨页面登录：扫码后页面跳转，新页面的 content.js 在此上报 confirmed
   (async () => {
-    const pendingId = localStorage.getItem('__xhs_login_pending');
+    const pendingId = localStorage.getItem(LOGIN_PENDING_KEY);
     if (pendingId && !isOnLoginPage()) {
-      localStorage.removeItem('__xhs_login_pending');
+      localStorage.removeItem(LOGIN_PENDING_KEY);
       await postJSON('/login_status', { account_id: pendingId, status: 'confirmed' });
       console.log('[Auto Upload] 跨页面登录已确认:', pendingId);
     }
