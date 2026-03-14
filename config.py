@@ -15,3 +15,8 @@ PLATFORM_URLS = {
     "douyin":      "https://creator.douyin.com/creator-micro/content/upload",
     "bilibili":    "https://member.bilibili.com/platform/upload/video/frame",
 }
+
+PLATFORM_MANAGE_URLS = {
+    "xiaohongshu": "https://creator.xiaohongshu.com/new/note-manager",
+    "channels":    "https://channels.weixin.qq.com/platform/post/list",
+}

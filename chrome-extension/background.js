@@ -1,5 +1,20 @@
 // background service worker
 
+// SPA 导航后自动重新注入 content.js
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId === 0) {  // 只处理顶层 frame
+    chrome.scripting.executeScript({
+      target: { tabId: details.tabId, allFrames: false },
+      files: ['content.js'],
+    }).catch(() => {});
+  }
+}, {
+  url: [
+    { hostContains: 'channels.weixin.qq.com' },
+    { hostContains: 'creator.xiaohongshu.com' },
+  ]
+});
+
 function sendCommand(tabId, method, params) {
   return new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params || {}, result => {
@@ -32,6 +47,18 @@ async function getViewportCenter(tabId, nodeId) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ── setFileInput: 向 DOM 中已存在的 file input 直接注入文件（支持 iframe）──
+  // ── reinject: 重新注入 content.js（SPA 导航后需要）─────────────────────
+  if (msg.type === 'reinject') {
+    const tabId = sender.tab.id;
+    chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      files: ['content.js'],
+    }, () => {
+      sendResponse({ ok: !chrome.runtime.lastError });
+    });
+    return true;
+  }
+
   // 用 Runtime.evaluate 拿到元素的 objectId，再用 DOM.setFileInputFiles(objectId) 注入
   // 这样完全绕开跨 iframe 的 nodeId 问题
   if (msg.type === 'setFileInput') {
@@ -226,6 +253,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!coordResult || !coordResult.value) throw new Error(`找不到元素: ${clickSelector}`);
         const { x: cx, y: cy } = coordResult.value;
 
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy });
         await sendCommand(tabId, 'Input.dispatchMouseEvent', {
           type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1,
         });

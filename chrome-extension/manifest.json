@@ -6,7 +6,8 @@
   "permissions": [
     "scripting",
     "activeTab",
-    "debugger"
+    "debugger",
+    "webNavigation"
   ],
   "host_permissions": [
     "https://creator.xiaohongshu.com/*",

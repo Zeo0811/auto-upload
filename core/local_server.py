@@ -36,6 +36,10 @@ _login_request_lock = threading.Lock()
 _login_state: dict = {}
 _login_state_lock = threading.Lock()
 
+# 管理操作结果 {task_id: dict}
+_manage_results: dict[str, dict] = {}
+_manage_results_lock = threading.Lock()
+
 
 def get_result(task_id: str) -> Optional[dict]:
     """有结果时返回 dict，否则返回 None"""
@@ -200,6 +204,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
 
+        # POST /task_result — 插件回传管理操作结果
+        if path == "/task_result":
+            task_id = body.get("task_id", "")
+            if task_id:
+                with _manage_results_lock:
+                    _manage_results[task_id] = body
+            self._json({"ok": True})
+            return
+
         # POST /login_status
         if path == "/login_status":
             account_id = body.get("account_id", "")
@@ -296,3 +309,15 @@ def clear_login_state(account_id: str):
     """清除登录状态（下次重新检测）"""
     with _login_state_lock:
         _login_state.pop(account_id, None)
+
+
+def get_manage_result(task_id: str) -> Optional[dict]:
+    """获取管理操作结果，有则返回 dict，否则 None"""
+    with _manage_results_lock:
+        return _manage_results.get(task_id)
+
+
+def clear_manage_result(task_id: str):
+    """清除管理操作结果"""
+    with _manage_results_lock:
+        _manage_results.pop(task_id, None)

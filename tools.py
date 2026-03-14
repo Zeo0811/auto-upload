@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from core.session import load_session, save_session
 from core.task_runner import create_task, update_task, get_task, run_task_in_background
-from config import TMP_DIR
+from config import TMP_DIR, PLATFORM_MANAGE_URLS
 
 
 # ====================================================================== #
@@ -202,7 +202,165 @@ def get_task_status(task_id: str) -> dict:
 
 
 # ====================================================================== #
-# 5. 工具函数
+# 5. 批量上传
+# ====================================================================== #
+
+def batch_upload(
+    platform: str,
+    account_id: str,
+    tasks: list[dict],
+) -> dict:
+    """
+    批量上传视频，顺序执行。每个任务完成（done/failed）后才执行下一个。
+
+    tasks: [{"source": {...}, "meta": {...}}, ...]
+
+    返回:
+      {"results": [{"task_id": "...", "status": "done|failed", ...}, ...]}
+    """
+    results = []
+    for i, t in enumerate(tasks):
+        r = upload_video(platform, account_id, t["source"], t["meta"])
+        if r.get("status") == "error":
+            results.append(r)
+            continue
+        task_id = r["task_id"]
+        # 等待任务完成
+        while True:
+            time.sleep(3)
+            status = get_task_status(task_id)
+            if status.get("status") in ("done", "failed"):
+                results.append(status)
+                break
+    return {"results": results}
+
+
+# ====================================================================== #
+# 6. 内容管理 — 列表查询
+# ====================================================================== #
+
+def _submit_manage_task(platform: str, account_id: str, manage_type: str, params: dict, timeout: int = 300) -> dict:
+    """提交管理任务到插件并等待结果的通用函数。自动处理登录。"""
+    import subprocess
+    from core.local_server import start_server, post_task, get_manage_result, clear_manage_result, get_progress
+
+    start_server()
+
+    # 先确保已登录（session 存在不代表 cookie 有效，但至少要有 session）
+    storage_state = load_session(platform, account_id)
+    if storage_state is None:
+        # 没有 session，走完整登录流程
+        login_result = login(platform, account_id)
+        if login_result.get("status") == "qr_required":
+            # 需要扫码，等待登录完成
+            for _ in range(90):
+                time.sleep(2)
+                r = check_login(platform, account_id)
+                if r.get("status") == "confirmed":
+                    break
+                if r.get("status") in ("expired", "error"):
+                    return {"status": "error", "error": f"登录失败: {r}"}
+            else:
+                return {"status": "error", "error": "等待扫码超时"}
+        elif login_result.get("status") not in ("ok", "confirmed"):
+            return {"status": "error", "error": f"登录失败: {login_result}"}
+
+    task_id = create_task(platform, account_id)
+    clear_manage_result(task_id)
+
+    # 打开管理页（先开页面，等插件加载后再投递任务）
+    manage_url = PLATFORM_MANAGE_URLS.get(platform)
+    if manage_url:
+        subprocess.run(["open", "-a", "Google Chrome", manage_url], capture_output=True)
+
+    # 等页面加载 + 插件初始化
+    time.sleep(4)
+
+    # 发布管理任务（复用 post_task，file_path 为空，通过 meta 传递管理参数）
+    manage_meta = {"_manage_type": manage_type, **params}
+    post_task(task_id, "", manage_meta, platform)
+
+    # 等待插件回传结果（同时监听登录请求，以防 cookie 过期）
+    from core.local_server import get_login_state, clear_login_state
+    from config import PLATFORM_URLS
+    manage_account = f"manage_{platform}"
+    login_handled = False
+
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(2)
+
+        # 检查管理操作结果
+        result = get_manage_result(task_id)
+        if result:
+            clear_manage_result(task_id)
+
+            return result
+
+        # 检查是否插件触发了登录（cookie 过期时）
+        if not login_handled:
+            state = get_login_state(manage_account)
+            if state:
+                status = state.get('status')
+                if status == 'qr_required':
+                    qr_path = state.get('qr_path', '')
+                    if qr_path:
+                        import os
+                        os.system(f"open '{qr_path}'")
+                        print(f"[管理操作] 需要重新登录，请扫码...")
+                elif status in ('ok', 'confirmed'):
+                    save_session(platform, account_id, {'logged_in': True})
+                    clear_login_state(manage_account)
+                    login_handled = True
+                    print(f"[管理操作] 登录成功，继续执行...")
+
+    return {"status": "error", "error": "管理操作超时"}
+
+
+def list_posts(platform: str, account_id: str, status_filter: str = "") -> dict:
+    """
+    查询已发布/未发布/定时待发的内容列表。
+
+    status_filter: ""(全部) | "published" | "scheduled" | "draft" | "审核中"
+
+    返回:
+      {"status": "ok", "posts": [{"post_id": "...", "title": "...", "status": "...", ...}, ...]}
+    """
+    return _submit_manage_task(platform, account_id, "list_posts", {
+        "status_filter": status_filter,
+    })
+
+
+def edit_post(platform: str, account_id: str, post_id: str, meta: dict) -> dict:
+    """
+    编辑已有内容。
+
+    meta: {"title": "...", "description": "...", "tags": [...], "publish_time": "YYYY-MM-DD HH:MM"}
+    只传需要修改的字段即可。
+
+    返回:
+      {"status": "ok"} 或 {"status": "error", "error": "..."}
+    """
+    return _submit_manage_task(platform, account_id, "edit_post", {
+        "post_id": post_id,
+        "meta": meta,
+    })
+
+
+def delete_post(platform: str, account_id: str, post_id: str) -> dict:
+    """
+    删除指定内容。
+
+    返回:
+      {"status": "ok"} 或 {"status": "error", "error": "..."}
+    """
+    return _submit_manage_task(platform, account_id, "delete_post", {
+        "post_id": post_id,
+    })
+
+
+# ====================================================================== #
+# 7. 工具函数
 # ====================================================================== #
 
 async def _resolve_source(source: dict, task_id: str):

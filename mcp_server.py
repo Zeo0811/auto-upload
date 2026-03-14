@@ -74,5 +74,47 @@ def get_task_status(task_id: str) -> dict:
     return tools.get_task_status(task_id)
 
 
+@mcp.tool()
+def batch_upload(platform: str, account_id: str, tasks: list[dict]) -> dict:
+    """
+    批量上传视频，顺序执行，每个任务完成后再执行下一个。
+
+    tasks: [{"source": {"type": "local", "path": "..."}, "meta": {"title": "...", ...}}, ...]
+
+    返回 {"results": [{"task_id": "...", "status": "done|failed", ...}, ...]}
+    """
+    return tools.batch_upload(platform, account_id, tasks)
+
+
+@mcp.tool()
+def list_posts(platform: str, account_id: str, status_filter: str = "") -> dict:
+    """
+    查询内容列表。
+    status_filter: "" (全部) | "published" | "scheduled" | "draft" | "审核中"
+
+    返回 {"status": "ok", "posts": [{"post_id": "...", "title": "...", "status": "...", ...}, ...]}
+    """
+    return tools.list_posts(platform, account_id, status_filter)
+
+
+@mcp.tool()
+def edit_post(platform: str, account_id: str, post_id: str, meta: dict) -> dict:
+    """
+    编辑已有内容的标题、描述、标签、定时时间。
+    meta: {"title": "...", "description": "...", "tags": [...], "publish_time": "YYYY-MM-DD HH:MM"}
+    只传需要修改的字段。
+    """
+    return tools.edit_post(platform, account_id, post_id, meta)
+
+
+@mcp.tool()
+def delete_post(platform: str, account_id: str, post_id: str) -> dict:
+    """
+    删除指定内容，直接执行不二次确认。
+    返回 {"status": "ok"} 或 {"status": "error", "error": "..."}
+    """
+    return tools.delete_post(platform, account_id, post_id)
+
+
 if __name__ == "__main__":
     mcp.run()

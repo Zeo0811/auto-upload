@@ -238,10 +238,65 @@
 
   async function runTask(task) {
     const platform = getPlatform();
-    console.log('[Auto Upload] 平台:', platform, '任务:', task.task_id);
+    const manageType = task.meta && task.meta._manage_type;
+    console.log('[Auto Upload] 平台:', platform, '任务:', task.task_id, manageType ? `管理操作: ${manageType}` : '上传');
+
+    // 管理操作分发
+    if (manageType) {
+      return runManageTask(platform, task, manageType);
+    }
+
+    // 上传操作
     if (platform === 'xiaohongshu') return runXhsTask(task);
     if (platform === 'channels')    return runChannelsTask(task);
     throw new Error('当前页面不是支持的平台: ' + location.hostname);
+  }
+
+  // -------------------------------------------------------------------------
+  // 管理操作分发
+  // -------------------------------------------------------------------------
+
+  async function runManageTask(platform, task, manageType) {
+    const { task_id, meta } = task;
+    try {
+      // 如果在登录页，先处理登录
+      if (isOnLoginPage()) {
+        console.log('[Auto Upload] 管理操作：检测到未登录，开始登录流程');
+        const loggedIn = await checkAndHandleLogin('manage_' + platform);
+        if (!loggedIn) {
+          await postJSON('/task_result', { task_id, status: 'error', error: '登录失败' });
+          return;
+        }
+        // 登录成功后等待页面跳转到管理页
+        await sleep(3000);
+      }
+
+      let result;
+      if (platform === 'xiaohongshu') {
+        if (manageType === 'list_posts')  result = await xhsListPosts(task_id, meta);
+        else if (manageType === 'edit_post')   result = await xhsEditPost(task_id, meta);
+        else if (manageType === 'delete_post') result = await xhsDeletePost(task_id, meta);
+        else throw new Error(`不支持的管理操作: ${manageType}`);
+      } else if (platform === 'channels') {
+        if (manageType === 'list_posts')  result = await channelsListPosts(task_id, meta);
+        else if (manageType === 'edit_post')   result = await channelsEditPost(task_id, meta);
+        else if (manageType === 'delete_post') result = await channelsDeletePost(task_id, meta);
+        else if (manageType === 'channels_edit_continue') {
+          await channelsEditContinue(task_id, meta);
+          result = { status: 'ok' };
+        }
+        else throw new Error(`不支持的管理操作: ${manageType}`);
+      } else {
+        throw new Error(`平台 ${platform} 不支持管理操作`);
+      }
+      // _deferred 表示结果由后续任务回传（如视频号编辑跳转）
+      if (!result?._deferred) {
+        await postJSON('/task_result', { task_id, ...result });
+      }
+    } catch (e) {
+      console.error('[Auto Upload] 管理操作失败:', e);
+      await postJSON('/task_result', { task_id, status: 'error', error: e.message });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1113,6 +1168,1422 @@
 
   // -------------------------------------------------------------------------
   // 轮询循环
+  // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // 小红书 — 内容管理
+  // -------------------------------------------------------------------------
+
+  async function xhsListPosts(taskId, meta) {
+    // 等待笔记列表 DOM 加载
+    for (let i = 0; i < 30; i++) {
+      if (document.querySelectorAll('.note').length > 0) break;
+      await sleep(1000);
+    }
+    await sleep(1000);
+
+    // 滚动加载全部笔记（滚动容器是 .content）
+    const scrollContainer = document.querySelector('.content') || document.documentElement;
+    let prevCount = 0;
+    let stableRounds = 0;
+    for (let i = 0; i < 100; i++) {
+      const currentCount = document.querySelectorAll('.note').length;
+      if (currentCount === prevCount) {
+        stableRounds++;
+        if (stableRounds >= 3) break;
+      } else {
+        stableRounds = 0;
+        prevCount = currentCount;
+      }
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      await sleep(1000);
+    }
+    scrollContainer.scrollTop = 0;
+    await sleep(500);
+
+    const statusFilter = meta.status_filter || '';
+    const posts = [];
+    const rows = document.querySelectorAll('.note');
+    console.log(`[Auto Upload] 小红书列表：共加载 ${rows.length} 条记录`);
+
+    for (const row of rows) {
+      // noteId 从 data-impression JSON 中提取
+      let postId = '';
+      try {
+        const imp = JSON.parse(row.getAttribute('data-impression') || '{}');
+        postId = imp.noteTarget?.value?.noteId || '';
+      } catch (e) {}
+
+      const titleEl = row.querySelector('.info .title');
+      const statusEl = row.querySelector('.info .raw span');
+      const timeEl = row.querySelector('.info .time_status .time');
+      const coverEl = row.querySelector('.media-bg');
+
+      const statusText = statusEl ? statusEl.textContent.trim() : '';
+      const timeText = timeEl ? timeEl.textContent.trim() : '';
+      const scheduleEl = row.querySelector('.info .time_status .schedule');
+
+      // 推断发布状态
+      let pubStatus = 'published';
+      if (statusText.includes('审核')) pubStatus = '审核中';
+      else if (scheduleEl) pubStatus = 'scheduled';
+
+      // 状态过滤
+      if (statusFilter) {
+        if (statusFilter === 'published' && pubStatus !== 'published') continue;
+        if (statusFilter === 'scheduled' && pubStatus !== 'scheduled') continue;
+        if (statusFilter === '审核中' && pubStatus !== '审核中') continue;
+      }
+
+      let coverUrl = '';
+      if (coverEl) {
+        const bg = coverEl.style.backgroundImage || '';
+        const m = bg.match(/url\("?(.+?)"?\)/);
+        if (m) coverUrl = m[1];
+      }
+
+      posts.push({
+        post_id: postId,
+        title: titleEl ? titleEl.textContent.trim() : '',
+        status: pubStatus,
+        status_text: statusText,
+        publish_time: timeText,
+        cover_url: coverUrl,
+      });
+    }
+
+    return { status: 'ok', posts };
+  }
+
+  async function xhsEditPost(taskId, meta) {
+    // 等待笔记列表加载
+    for (let i = 0; i < 30; i++) {
+      if (document.querySelectorAll('.note').length > 0) break;
+      await sleep(1000);
+    }
+    await sleep(1000);
+
+    const postId = meta.post_id;
+    if (!postId) return { status: 'error', error: '缺少 post_id' };
+
+    const row = xhsFindNoteByPostId(postId);
+    if (!row) return { status: 'error', error: `找不到 noteId=${postId} 的笔记` };
+
+    // 点击编辑按钮
+    const editBtn = row.querySelector('.data-edit');
+    if (!editBtn) return { status: 'error', error: '找不到编辑按钮' };
+    editBtn.click();
+
+    // 等待编辑区域加载（TipTap/ProseMirror 编辑器）
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
+      if (document.querySelector('input.d-text') || document.querySelector('.tiptap.ProseMirror')) break;
+    }
+    await sleep(1000);
+
+    const editMeta = meta.meta || {};
+
+    // 修改标题
+    if (editMeta.title !== undefined) {
+      const titleEl = document.querySelector('input.d-text[type="text"]');
+      if (titleEl) {
+        const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        nativeSetter.call(titleEl, editMeta.title);
+        titleEl.dispatchEvent(new Event('input', { bubbles: true }));
+        titleEl.dispatchEvent(new Event('change', { bubbles: true }));
+        console.log('[Auto Upload] 编辑：标题已修改');
+      }
+    }
+
+    // 修改描述 + 标签（TipTap ProseMirror 编辑器）
+    if (editMeta.description !== undefined || (editMeta.tags && editMeta.tags.length > 0)) {
+      const descEl = document.querySelector('.tiptap.ProseMirror[contenteditable="true"]');
+      if (descEl) {
+        descEl.focus();
+        await sleep(300);
+        // 清空原有内容
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        await sleep(200);
+
+        // 插入描述
+        if (editMeta.description) {
+          document.execCommand('insertText', false, editMeta.description);
+          descEl.dispatchEvent(new Event('input', { bubbles: true }));
+          await sleep(300);
+        }
+
+        // 插入标签
+        if (editMeta.tags && editMeta.tags.length > 0) {
+          if (editMeta.description) {
+            document.execCommand('insertText', false, ' ');
+            await sleep(200);
+          }
+          for (const tag of editMeta.tags) {
+            document.execCommand('insertText', false, `#${tag}`);
+            descEl.dispatchEvent(new Event('input', { bubbles: true }));
+            // 等话题建议弹窗
+            let topicPopup = null;
+            for (let i = 0; i < 8; i++) {
+              await sleep(250);
+              topicPopup = document.querySelector('[class*="topic-container"], [class*="topic-list"]');
+              if (topicPopup) break;
+            }
+            if (topicPopup) {
+              const firstItem = topicPopup.querySelector('[class*="item"]');
+              if (firstItem) {
+                firstItem.click();
+                await sleep(400);
+              }
+              descEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+              descEl.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', keyCode: 13, bubbles: true }));
+              await sleep(300);
+            } else {
+              document.execCommand('insertText', false, ' ');
+              await sleep(200);
+            }
+          }
+        }
+        console.log('[Auto Upload] 编辑：描述/标签已修改');
+      }
+    }
+
+    // 重新上传视频
+    if (editMeta.video_path) {
+      const reuploadBtn = document.querySelector('.video-plugin-title-action');
+      if (reuploadBtn) {
+        console.log('[Auto Upload] 编辑：重新上传视频');
+        const result = await chrome.runtime.sendMessage({
+          type: 'setFileViaChooser',
+          filePath: editMeta.video_path,
+          clickSelector: '.video-plugin-title-action',
+        });
+        console.log('[Auto Upload] 编辑：视频上传结果', result);
+        // 等待视频上传完成（发布按钮从 disabled 变为可用）
+        for (let i = 0; i < 300; i++) {
+          await sleep(2000);
+          const btn = document.querySelector('.publish-page-publish-btn button');
+          if (btn && !btn.disabled && !btn.classList.contains('disabled')) {
+            console.log('[Auto Upload] 编辑：视频上传完成，按钮可用');
+            break;
+          }
+        }
+        await sleep(2000);
+      }
+    }
+
+    // 定时发布设置
+    if (editMeta.publish_time !== undefined) {
+      // 辅助：scrollIntoView 后 CDP 点击
+      async function cdpClickEl(el) {
+        el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        await sleep(200);
+        const tid = '__xhs_edit_' + Date.now();
+        el.id = tid;
+        await chrome.runtime.sendMessage({ type: 'cdpClick', selector: `#${tid}` });
+        el.id = '';
+        await sleep(400);
+      }
+
+      let scheduleSwitch = null;
+      for (let i = 0; i < 10; i++) {
+        scheduleSwitch = document.querySelector('.post-time-wrapper .d-switch-simulator');
+        if (scheduleSwitch) break;
+        await sleep(500);
+      }
+
+      if (editMeta.publish_time === '' || editMeta.publish_time === null) {
+        // 取消定时发布（关闭开关）
+        if (scheduleSwitch && !scheduleSwitch.classList.contains('unchecked')) {
+          scheduleSwitch.scrollIntoView({ block: 'center' });
+          await sleep(300);
+          scheduleSwitch.click();
+          await sleep(500);
+          console.log('[Auto Upload] 编辑：已取消定时发布');
+        }
+      } else {
+        // 设置定时发布
+        const [datePart, timePart] = editMeta.publish_time.split(' ');
+        const [, , targetDay] = datePart.split('-');
+        const [targetHour, targetMin] = timePart.split(':');
+        const targetDayNum = String(parseInt(targetDay, 10));
+
+        // 打开定时开关
+        const isUnchecked = scheduleSwitch?.classList.contains('unchecked');
+        if (scheduleSwitch && isUnchecked) {
+          scheduleSwitch.scrollIntoView({ block: 'center' });
+          await sleep(600);
+          scheduleSwitch.click();
+          await sleep(1500);
+        }
+
+        // 点击日期输入框打开弹窗
+        let dtInput = null;
+        for (let i = 0; i < 8; i++) {
+          dtInput = document.querySelector('.d-datepicker input');
+          if (dtInput) break;
+          await sleep(500);
+        }
+        if (dtInput) {
+          await cdpClickEl(dtInput);
+          await sleep(800);
+
+          let popover = null;
+          for (let i = 0; i < 10; i++) {
+            popover = document.querySelector('.post-time-date-picker-popover-class');
+            if (popover) break;
+            await sleep(300);
+          }
+          if (popover) {
+            // 选日期
+            const dayCells = Array.from(popover.querySelectorAll('.d-datepicker-cell.d-clickable:not(.disabled)'));
+            const dayCell = dayCells.find(c =>
+              (c.querySelector('span.d-text-monospace') || c.querySelector('span') || c).textContent.trim() === targetDayNum
+            );
+            if (dayCell) { await cdpClickEl(dayCell); await sleep(600); }
+
+            // 选小时 + 分钟
+            const timeBars = Array.from(popover.querySelectorAll('.d-timepicker-timebar'));
+            async function clickTimeItem(bar, target) {
+              const item = Array.from(bar.querySelectorAll('.d-timepicker-time')).find(el =>
+                (el.querySelector('span.d-text-monospace') || el.querySelector('span') || el).textContent.trim() === target
+              );
+              if (item) { await cdpClickEl(item); }
+            }
+            if (timeBars[0]) await clickTimeItem(timeBars[0], targetHour);
+            if (timeBars[1]) await clickTimeItem(timeBars[1], targetMin);
+          }
+        }
+        console.log('[Auto Upload] 编辑：定时发布已设置', editMeta.publish_time);
+        await sleep(500);
+      }
+    }
+
+    // 点击编辑器外部收起弹窗
+    await sleep(500);
+    document.body.click();
+    await sleep(500);
+
+    // 点击发布/保存按钮（用 CDP 点击确保生效）
+    const publishBtn = document.querySelector('.publish-page-publish-btn button');
+    if (publishBtn) {
+      publishBtn.scrollIntoView({ block: 'center' });
+      await sleep(500);
+      await chrome.runtime.sendMessage({ type: 'cdpClick', selector: '.publish-page-publish-btn button' });
+      console.log('[Auto Upload] 编辑：已点击发布按钮');
+      await sleep(2000);
+    } else {
+      console.warn('[Auto Upload] 编辑：未找到发布按钮');
+    }
+
+    return { status: 'ok' };
+  }
+
+  async function xhsDeletePost(taskId, meta) {
+    for (let i = 0; i < 30; i++) {
+      if (document.querySelectorAll('.note').length > 0) break;
+      await sleep(1000);
+    }
+    await sleep(1000);
+
+    const postId = meta.post_id;
+    if (!postId) return { status: 'error', error: '缺少 post_id' };
+
+    const row = xhsFindNoteByPostId(postId);
+    if (!row) return { status: 'error', error: `找不到 noteId=${postId} 的笔记` };
+
+    // 点击删除按钮
+    const delBtn = row.querySelector('.data-del');
+    if (!delBtn) return { status: 'error', error: '找不到删除按钮' };
+    delBtn.click();
+    await sleep(1000);
+
+    // 确认删除弹窗 — 点击确认按钮
+    const confirmBtns = document.querySelectorAll('.d-dialog button, .d-modal button, [class*="dialog"] button, [class*="modal"] button');
+    for (const btn of confirmBtns) {
+      const text = (btn.textContent || '').trim();
+      if (text === '确认' || text === '确定' || text === '删除') {
+        btn.click();
+        await sleep(1000);
+        return { status: 'ok' };
+      }
+    }
+
+    return { status: 'error', error: '未找到删除确认按钮' };
+  }
+
+  function xhsFindNoteByPostId(postId) {
+    const rows = document.querySelectorAll('.note');
+    for (const row of rows) {
+      try {
+        const imp = JSON.parse(row.getAttribute('data-impression') || '{}');
+        if (imp.noteTarget?.value?.noteId === postId) return row;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // 视频号 — 内容管理
+  // -------------------------------------------------------------------------
+
+  async function channelsRunInIframe(expression) {
+    // 通过 runInPage 在页面上下文中访问 iframe DOM
+    const result = await chrome.runtime.sendMessage({
+      type: 'runInPage',
+      expression: `(function() {
+        const iframes = document.querySelectorAll('iframe');
+        for (const iframe of iframes) {
+          try {
+            const doc = iframe.contentDocument;
+            if (!doc) continue;
+            if (doc.querySelectorAll('.post-feed-item').length > 0) {
+              return (function(doc, iframe) { ${expression} })(doc, iframe);
+            }
+          } catch(e) {}
+        }
+        return null;
+      })()`
+    });
+    return result?.result;
+  }
+
+  async function channelsListPosts(taskId, meta) {
+    // 等待列表 DOM 加载（通过 runInPage 在页面上下文中查询 iframe）
+    let itemCount = 0;
+    for (let i = 0; i < 60; i++) {
+      const count = await channelsRunInIframe('return doc.querySelectorAll(".post-feed-item").length;');
+      console.log(`[Auto Upload] 视频号列表等待中... postItems=${count}`);
+      if (count && count > 0) { itemCount = count; break; }
+      await sleep(1000);
+    }
+    if (!itemCount) return { status: 'error', error: '视频号列表未加载（60s超时）' };
+    await sleep(1000);
+
+    // 逐页采集所有数据
+    const statusFilter = meta.status_filter || '';
+    let allPosts = [];
+    let globalIndex = 0;
+
+    for (let page = 0; page < 50; page++) {  // 最多 50 页
+      // 解析当前页
+      const postsData = await channelsRunInIframe(`
+        const rows = doc.querySelectorAll('.post-feed-item');
+        const posts = [];
+        const statusFilter = ${JSON.stringify(statusFilter)};
+        const globalOffset = ${globalIndex};
+        rows.forEach(function(row, index) {
+          const titleEl = row.querySelector('.post-title');
+          const postedTimeEl = row.querySelector('.posted-info .post-time span');
+          const scheduledTimeEl = row.querySelector('.unposted-info .effective-time');
+          const isScheduled = !!scheduledTimeEl;
+          const pubStatus = isScheduled ? 'scheduled' : 'published';
+          if (statusFilter) {
+            if (statusFilter === 'published' && pubStatus !== 'published') return;
+            if (statusFilter === 'scheduled' && pubStatus !== 'scheduled') return;
+          }
+          const timeText = scheduledTimeEl ? scheduledTimeEl.textContent.trim()
+                         : postedTimeEl ? postedTimeEl.textContent.trim() : '';
+          const stats = {};
+          const statNames = ['views', 'likes', 'comments', 'shares', 'favorites'];
+          row.querySelectorAll('.post-data .data-item .count').forEach(function(el, i) {
+            if (statNames[i]) stats[statNames[i]] = parseInt(el.textContent.trim(), 10) || 0;
+          });
+          const canEdit = !!row.querySelector('use[*|href="#icon-edit_feed"]');
+          const coverEl = row.querySelector('.thumb');
+          posts.push({
+            post_id: String(globalOffset + index),
+            title: titleEl ? titleEl.textContent.trim() : '',
+            status: pubStatus,
+            publish_time: timeText,
+            cover_url: coverEl ? coverEl.src : '',
+            can_edit: canEdit,
+            views: stats.views || 0,
+            likes: stats.likes || 0,
+            comments: stats.comments || 0,
+            shares: stats.shares || 0,
+            favorites: stats.favorites || 0,
+          });
+        });
+        return { posts: posts, total: rows.length };
+      `);
+
+      if (postsData && postsData.posts) {
+        allPosts = allPosts.concat(postsData.posts);
+        globalIndex += postsData.total || 0;
+      }
+
+      // 检查是否有下一页按钮
+      const hasNext = await channelsRunInIframe(`
+        const nextBtn = doc.querySelector('.weui-desktop-pagination a');
+        if (nextBtn && nextBtn.textContent.trim() === '下一页') {
+          nextBtn.click();
+          return true;
+        }
+        return false;
+      `);
+
+      if (!hasNext) break;
+
+      // 等待新页面加载
+      await sleep(2000);
+      // 等待列表刷新
+      for (let i = 0; i < 15; i++) {
+        const count = await channelsRunInIframe('return doc.querySelectorAll(".post-feed-item").length;');
+        if (count && count > 0) break;
+        await sleep(500);
+      }
+      await sleep(500);
+    }
+
+    console.log(`[Auto Upload] 视频号列表：共加载 ${allPosts.length} 条记录`);
+    return { status: 'ok', posts: allPosts };
+  }
+
+  async function channelsNavigateToPage(targetIndex) {
+    // 等待列表加载
+    for (let i = 0; i < 30; i++) {
+      const count = await channelsRunInIframe('return doc.querySelectorAll(".post-feed-item").length;');
+      if (count && count > 0) break;
+      await sleep(1000);
+    }
+    await sleep(1000);
+
+    // 获取每页条数
+    const pageSize = await channelsRunInIframe('return doc.querySelectorAll(".post-feed-item").length;') || 20;
+    const targetPage = Math.floor(targetIndex / pageSize);  // 0-based
+    const indexInPage = targetIndex % pageSize;
+
+    // 翻到目标页
+    for (let p = 0; p < targetPage; p++) {
+      const clicked = await channelsRunInIframe(`
+        const links = doc.querySelectorAll('.weui-desktop-pagination a');
+        for (const a of links) {
+          if (a.textContent.trim() === '下一页') { a.click(); return true; }
+        }
+        return false;
+      `);
+      if (!clicked) break;
+      await sleep(2000);
+      // 等新页面加载
+      for (let i = 0; i < 15; i++) {
+        const c = await channelsRunInIframe('return doc.querySelectorAll(".post-feed-item").length;');
+        if (c && c > 0) break;
+        await sleep(500);
+      }
+      await sleep(500);
+    }
+
+    return indexInPage;
+  }
+
+  async function channelsEditPost(taskId, meta) {
+    const postIndex = parseInt(meta.post_id, 10);
+    if (isNaN(postIndex)) return { status: 'error', error: '缺少 post_id (index)' };
+
+    const indexInPage = await channelsNavigateToPage(postIndex);
+
+    // 在 iframe 中点击编辑按钮（强制显示 + 直接 click）
+    const clickResult = await channelsRunInIframe(`
+      const rows = doc.querySelectorAll('.post-feed-item');
+      if (${indexInPage} >= rows.length) return { error: '索引超出范围' };
+      const row = rows[${indexInPage}];
+      const editIcon = row.querySelector('use[*|href="#icon-edit_feed"]');
+      if (!editIcon) return { error: '该内容不支持编辑（已发布内容无法修改）' };
+      const opr = row.querySelector('.opr');
+      if (opr) opr.style.cssText = 'opacity:1 !important; visibility:visible !important; display:flex !important;';
+      row.querySelectorAll('.opr-item-wrap').forEach(function(el) {
+        el.style.cssText = 'opacity:1 !important; visibility:visible !important; display:flex !important;';
+      });
+      const editBtn = editIcon.closest('.opr-item') || editIcon.closest('.opr-item-wrap');
+      editBtn.click();
+      return { ok: true };
+    `);
+    if (clickResult?.error) return { status: 'error', error: clickResult.error };
+
+    // 等待编辑页加载（SPA 内部导航，JS 上下文不变）
+    for (let i = 0; i < 30; i++) {
+      await sleep(1000);
+      const found = await runInPage(`
+        (function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              if (doc && doc.querySelector('.post-desc-box .input-editor')) return true;
+            } catch(e) {}
+          }
+          return false;
+        })()
+      `);
+      if (found?.result === true) break;
+    }
+    await sleep(2000);
+
+    const editMeta = meta.meta || {};
+
+    // 填写标题/描述/标签
+    if (editMeta.title !== undefined || editMeta.description !== undefined || (editMeta.tags && editMeta.tags.length > 0)) {
+      const fillResult = await runInPage(`
+        (function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              if (!doc) continue;
+              var editor = doc.querySelector('.post-desc-box .input-editor');
+              if (!editor) continue;
+              ${editMeta.title !== undefined ? `
+              editor.innerHTML = '';
+              editor.focus();
+              document.execCommand('insertText', false, ${JSON.stringify(editMeta.title || '')});
+              ` : ''}
+              ${editMeta.description !== undefined ? `
+              document.execCommand('insertText', false, '\\n' + ${JSON.stringify(editMeta.description || '')});
+              ` : ''}
+              ${editMeta.tags && editMeta.tags.length > 0 ? `
+              var tags = ${JSON.stringify(editMeta.tags)};
+              for (var t = 0; t < tags.length; t++) {
+                document.execCommand('insertText', false, ' #' + tags[t]);
+              }
+              ` : ''}
+              editor.dispatchEvent(new Event('input', { bubbles: true }));
+              return { ok: true };
+            } catch(e) {}
+          }
+          return { ok: false };
+        })()
+      `);
+      console.log('[Auto Upload] 视频号编辑：填写结果', fillResult);
+      await sleep(1000);
+    }
+
+    // 封面修改
+    if (editMeta.cover_path) {
+      console.log('[Auto Upload] 视频号编辑：开始修改封面');
+
+      // 封面上传通用函数（带重试）
+      async function channelsEditUploadCover(editBtnSelector, label, maxRetries) {
+        for (let retry = 0; retry < maxRetries; retry++) {
+          if (retry > 0) console.log(`[Auto Upload] ${label}封面重试第 ${retry} 次`);
+
+          // 滚动编辑按钮到可视区域
+          await runInPage(`(function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var el = iframes[i].contentDocument.querySelector(${JSON.stringify(editBtnSelector)});
+                if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); return; }
+              } catch(e) {}
+            }
+          })()`);
+          await sleep(1000);
+
+          // 点击编辑按钮
+          const editResult = await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: editBtnSelector });
+          console.log(`[Auto Upload] ${label}编辑按钮:`, JSON.stringify(editResult));
+          if (!editResult?.ok) {
+            await sleep(3000);
+            continue;
+          }
+          await sleep(2000);
+
+          // 等待弹窗打开并查找 .add-icon
+          let addIconFound = false;
+          let dialogOpen = false;
+          for (let i = 0; i < 10; i++) {
+            await sleep(1000);
+            const check = await runInPage(`
+              (function() {
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                  try {
+                    var doc = iframes[i].contentDocument;
+                    var dialog = doc.querySelector('.cover-set-footer');
+                    if (!dialog) continue;
+                    var els = doc.querySelectorAll('.add-icon');
+                    for (var j = 0; j < els.length; j++) {
+                      var r = els[j].getBoundingClientRect();
+                      if (r.width > 0 && r.height > 0) return { found: true };
+                    }
+                    return { found: false, dialogOpen: true };
+                  } catch(e) {}
+                }
+                return { found: false };
+              })()
+            `);
+            if (check?.result?.found) { addIconFound = true; break; }
+            if (check?.result?.dialogOpen) { dialogOpen = true; break; }
+          }
+
+          // 弹窗已打开但 .add-icon 不可见 → 需要先点击「上传封面」切换到上传模式
+          if (!addIconFound && dialogOpen) {
+            console.log(`[Auto Upload] ${label} 弹窗已打开但无 .add-icon，点击「上传封面」`);
+            await runInPage(`(function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var doc = iframes[i].contentDocument;
+                  var wraps = doc.querySelectorAll('.text-wrap');
+                  for (var j = 0; j < wraps.length; j++) {
+                    if (wraps[j].textContent.trim() === '上传封面') {
+                      var clickTarget = wraps[j].closest('.wrap') || wraps[j];
+                      clickTarget.click();
+                      return;
+                    }
+                  }
+                } catch(e) {}
+              }
+            })()`);
+            await sleep(2000);
+
+            // 再次等待 .add-icon 出现
+            for (let i = 0; i < 10; i++) {
+              await sleep(1000);
+              const check = await runInPage(`
+                (function() {
+                  var iframes = document.querySelectorAll('iframe');
+                  for (var i = 0; i < iframes.length; i++) {
+                    try {
+                      var els = iframes[i].contentDocument.querySelectorAll('.add-icon');
+                      for (var j = 0; j < els.length; j++) {
+                        var r = els[j].getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true;
+                      }
+                    } catch(e) {}
+                  }
+                  return false;
+                })()
+              `);
+              if (check?.result === true) { addIconFound = true; break; }
+            }
+          }
+
+          if (!addIconFound) {
+            // 关闭可能的弹窗再重试
+            await runInPage(`(function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var btn = iframes[i].contentDocument.querySelector('.cover-set-footer .weui-desktop-btn_default');
+                  if (btn) btn.click();
+                } catch(e) {}
+              }
+            })()`);
+            await sleep(2000);
+            continue;
+          }
+
+          // 上传封面文件（点击 .initial-wrap 即「上传封面」可点击区域）
+          const coverResult = await chrome.runtime.sendMessage({
+            type: 'setFileViaChooser', filePath: editMeta.cover_path, clickSelector: '.initial-wrap',
+          });
+          if (!coverResult?.ok) {
+            console.warn(`[Auto Upload] ${label}封面上传失败:`, coverResult?.error);
+            await sleep(2000);
+            continue;
+          }
+          console.log(`[Auto Upload] ${label}封面上传成功`);
+          await sleep(3000);
+
+          // 点击确认
+          await runInPage(`(function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var btn = iframes[i].contentDocument.querySelector('.cover-set-footer .weui-desktop-btn_primary');
+                if (btn) { btn.click(); return; }
+              } catch(e) {}
+            }
+          })()`);
+          await sleep(2000);
+          return true;
+        }
+        console.warn(`[Auto Upload] ${label}封面修改失败（已重试 ${maxRetries} 次）`);
+        return false;
+      }
+
+      // 等待视频预览图完全加载（.edit-btn 可见）
+      let editBtnReady = false;
+      for (let i = 0; i < 60; i++) {
+        const found = await runInPage(`
+          (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var btn = iframes[i].contentDocument.querySelector('.vertical-img-wrap .edit-btn');
+                if (btn && btn.offsetParent) return true;
+              } catch(e) {}
+            }
+            return false;
+          })()
+        `);
+        if (found?.result === true) { editBtnReady = true; break; }
+        if (i % 10 === 0) console.log(`[Auto Upload] 等待封面预览图加载... (${i * 2}s)`);
+        await sleep(2000);
+      }
+      if (editBtnReady) {
+        // 滚动封面区域到可视区域，确保 CDP 鼠标事件能命中
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var el = iframes[i].contentDocument.querySelector('.vertical-img-wrap .edit-btn');
+              if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); return; }
+            } catch(e) {}
+          }
+        })()`);
+        await sleep(15000); // 等待页面稳定
+
+        // 个人卡片封面（最多重试 3 次）
+        await channelsEditUploadCover('.vertical-img-wrap .edit-btn', '个人卡片', 3);
+
+        // 分享卡片封面（横屏视频才有）
+        const hasHorizon = await runInPage(`
+          (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var el = iframes[i].contentDocument.querySelector('.horizon-img-wrap .edit-btn');
+                if (el && el.offsetParent) return true;
+              } catch(e) {}
+            }
+            return false;
+          })()
+        `);
+        if (hasHorizon?.result === true) {
+          console.log('[Auto Upload] 视频号编辑：处理分享卡片封面');
+
+          // Step 1: 滚动并点击分享卡片编辑按钮
+          await runInPage(`(function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var el = iframes[i].contentDocument.querySelector('.horizon-img-wrap .edit-btn');
+                if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); return; }
+              } catch(e) {}
+            }
+          })()`);
+          await sleep(1000);
+          await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.horizon-img-wrap .edit-btn' });
+          await sleep(2000);
+
+          // Step 2: 点击 .cover-tips（切换到分享卡片模式）
+          await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.cover-tips' });
+          await sleep(1500);
+
+          // Step 3: 点击「使用素材」按钮
+          await runInPage(`(function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var btns = iframes[i].contentDocument.querySelectorAll('.weui-desktop-btn_primary');
+                for (var j = 0; j < btns.length; j++) {
+                  if (btns[j].textContent.trim() === '使用素材') { btns[j].click(); return; }
+                }
+              } catch(e) {}
+            }
+          })()`);
+          await sleep(2000);
+
+          // Step 4: 在裁剪器中拖动图片到顶部
+          const dragResult = await runInPage(`(function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var vp = iframes[i].contentDocument.querySelector('.cr-viewport');
+                if (!vp) continue;
+                var img = iframes[i].contentDocument.querySelector('.cr-image');
+                if (!img) continue;
+                var vpRect = vp.getBoundingClientRect();
+                var imgRect = img.getBoundingClientRect();
+                var frRect = iframes[i].getBoundingClientRect();
+                return {
+                  found: true,
+                  vpCx: frRect.left + vpRect.left + vpRect.width / 2,
+                  vpCy: frRect.top + vpRect.top + vpRect.height / 2,
+                  dragY: vpRect.top - imgRect.top
+                };
+              } catch(e) {}
+            }
+            return { found: false };
+          })()`);
+          console.log('[Auto Upload] 分享卡片裁剪器:', JSON.stringify(dragResult));
+
+          if (dragResult?.result?.found && dragResult.result.dragY > 0) {
+            const { vpCx, vpCy, dragY } = dragResult.result;
+            await chrome.runtime.sendMessage({
+              type: 'cdpDrag',
+              startX: vpCx, startY: vpCy,
+              endX: vpCx, endY: vpCy + dragY,
+            });
+            await sleep(1000);
+          }
+
+          // Step 5: 点击确认
+          await runInPage(`(function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var btns = iframes[i].contentDocument.querySelectorAll('.weui-desktop-btn_primary');
+                for (var j = btns.length - 1; j >= 0; j--) {
+                  if (btns[j].offsetParent && btns[j].textContent.trim().match(/确认|完成|保存/)) {
+                    btns[j].click(); return;
+                  }
+                }
+              } catch(e) {}
+            }
+          })()`);
+          await sleep(2000);
+        }
+      } else {
+        console.warn('[Auto Upload] 视频号编辑：等待封面预览图超时，跳过封面修改');
+      }
+      console.log('[Auto Upload] 视频号编辑：封面修改完成');
+    }
+
+    // 定时发布设置
+    if (editMeta.publish_time !== undefined) {
+      // 滚动定时发布区域到可视范围
+      await runInPage(`(function() {
+        var iframes = document.querySelectorAll('iframe');
+        for (var i = 0; i < iframes.length; i++) {
+          try {
+            var el = iframes[i].contentDocument.querySelector('.weui-desktop-form__radio[value="1"]');
+            if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); return; }
+          } catch(e) {}
+        }
+      })()`);
+      await sleep(1000);
+
+      if (editMeta.publish_time === '' || editMeta.publish_time === null) {
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var r = iframes[i].contentDocument.querySelector('.weui-desktop-form__radio[value="0"]');
+              if (r) { r.click(); return; }
+            } catch(e) {}
+          }
+        })()`);
+        console.log('[Auto Upload] 视频号编辑：已取消定时发布');
+        await sleep(500);
+      } else {
+        const [datePart, timePart] = editMeta.publish_time.split(' ');
+        const [, , targetDay] = datePart.split('-');
+        const [targetHour, targetMin] = timePart.split(':');
+        const dayNum = String(parseInt(targetDay, 10));
+        const hourStr = String(parseInt(targetHour, 10)).padStart(2, '0');
+        const minStr = String(parseInt(targetMin, 10)).padStart(2, '0');
+        console.log(`[Auto Upload] 视频号编辑：定时发布解析 原始值="${editMeta.publish_time}" 日=${dayNum} 时=${hourStr} 分=${minStr}`);
+
+        // 点击"定时发布"单选按钮
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var r = iframes[i].contentDocument.querySelector('.weui-desktop-form__radio[value="1"]');
+              if (r) { r.click(); return; }
+            } catch(e) {}
+          }
+        })()`);
+        await sleep(1000);
+
+        // 点击日期输入框打开日期选择器
+        await chrome.runtime.sendMessage({
+          type: 'cdpClickIframe',
+          selector: '.weui-desktop-form__input[placeholder="请选择发表时间"]',
+        });
+        await sleep(1000);
+
+        // 选择日期
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+              for (var j = 0; j < links.length; j++) {
+                var a = links[j];
+                if (a.classList.contains('weui-desktop-picker__disabled') || a.classList.contains('weui-desktop-picker__faded')) continue;
+                if (a.textContent.trim() === ${JSON.stringify(dayNum)}) { a.click(); return; }
+              }
+            } catch(e) {}
+          }
+        })()`);
+        await sleep(500);
+
+        // 点击时间区域展开时间面板
+        await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-picker__dt' });
+        await sleep(1000);
+
+        // 选择小时（滚动式选择器，通过滚动 ol 到目标位置实现选中）
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              var ol = doc.querySelector('.weui-desktop-picker__time__hour');
+              if (!ol) continue;
+              var items = ol.querySelectorAll('li');
+              for (var j = 0; j < items.length; j++) {
+                if (items[j].textContent.trim() === ${JSON.stringify(hourStr)}) {
+                  var liH = items[j].offsetHeight;
+                  ol.scrollTop = j * liH;
+                  ol.dispatchEvent(new Event('scroll', { bubbles: true }));
+                  items[j].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                  items[j].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                  items[j].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                  return;
+                }
+              }
+            } catch(e) {}
+          }
+        })()`);
+        await sleep(500);
+
+        // 选择分钟
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              var ol = doc.querySelector('.weui-desktop-picker__time__minute');
+              if (!ol) continue;
+              var items = ol.querySelectorAll('li');
+              for (var j = 0; j < items.length; j++) {
+                if (items[j].textContent.trim() === ${JSON.stringify(minStr)}) {
+                  var liH = items[j].offsetHeight;
+                  ol.scrollTop = j * liH;
+                  ol.dispatchEvent(new Event('scroll', { bubbles: true }));
+                  items[j].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                  items[j].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                  items[j].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                  return;
+                }
+              }
+            } catch(e) {}
+          }
+        })()`);
+        await sleep(500);
+
+        // 点击空白处关闭时间选择器
+        await runInPage(`(function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var body = iframes[i].contentDocument.querySelector('.form-btns') || iframes[i].contentDocument.body;
+              if (body) { body.click(); return; }
+            } catch(e) {}
+          }
+        })()`);
+        await sleep(500);
+        console.log('[Auto Upload] 视频号编辑：定时发布已设置', editMeta.publish_time);
+      }
+    }
+
+    // 滚动到「发表」按钮并点击
+    await runInPage(`(function() {
+      var iframes = document.querySelectorAll('iframe');
+      for (var i = 0; i < iframes.length; i++) {
+        try {
+          var btns = iframes[i].contentDocument.querySelectorAll('button.weui-desktop-btn_primary');
+          for (var j = 0; j < btns.length; j++) {
+            if (btns[j].textContent.trim() === '发表') {
+              btns[j].scrollIntoView({ block: 'center', behavior: 'smooth' });
+              return;
+            }
+          }
+        } catch(e) {}
+      }
+    })()`);
+    await sleep(1000);
+    await runInPage(`(function() {
+      var iframes = document.querySelectorAll('iframe');
+      for (var i = 0; i < iframes.length; i++) {
+        try {
+          var btns = iframes[i].contentDocument.querySelectorAll('button.weui-desktop-btn_primary');
+          for (var j = 0; j < btns.length; j++) {
+            if (btns[j].textContent.trim() === '发表') { btns[j].click(); return; }
+          }
+        } catch(e) {}
+      }
+    })()`);
+    console.log('[Auto Upload] 视频号编辑：已点击发表按钮');
+    await sleep(3000);
+
+    // 处理可能出现的「将此次编辑保留?」弹窗 → 点击「不保留」离开
+    await runInPage(`(function() {
+      var iframes = document.querySelectorAll('iframe');
+      for (var i = 0; i < iframes.length; i++) {
+        try {
+          var doc = iframes[i].contentDocument;
+          var title = doc.querySelector('.weui-desktop-dialog__title');
+          if (title && title.textContent.trim() === '将此次编辑保留?') {
+            var btns = doc.querySelectorAll('.weui-desktop-dialog .weui-desktop-btn');
+            for (var j = 0; j < btns.length; j++) {
+              if (btns[j].textContent.trim() === '不保留') { btns[j].click(); return; }
+            }
+          }
+        } catch(e) {}
+      }
+    })()`);
+    await sleep(1000);
+
+    return { status: 'ok' };
+  }
+
+  // 视频号编辑续接（在发布页执行）
+  async function channelsEditContinue(taskId, meta) {
+    // 等待编辑页 iframe 加载
+    for (let i = 0; i < 30; i++) {
+      const found = await runInPage(`
+        (function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              if (doc && doc.querySelector('.post-desc-box .input-editor')) return true;
+            } catch(e) {}
+          }
+          return false;
+        })()
+      `);
+      if (found?.result === true) break;
+      await sleep(1000);
+    }
+    await sleep(2000);
+
+    // 填写标题/描述/标签
+    if (meta.title !== undefined || meta.description !== undefined || (meta.tags && meta.tags.length > 0)) {
+      const fillResult = await runInPage(`
+        (function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var doc = iframes[i].contentDocument;
+              if (!doc) continue;
+              var editor = doc.querySelector('.post-desc-box .input-editor');
+              if (!editor) continue;
+              ${meta.title !== undefined ? `
+              editor.innerHTML = '';
+              editor.focus();
+              document.execCommand('insertText', false, ${JSON.stringify(meta.title || '')});
+              ` : ''}
+              ${meta.description !== undefined ? `
+              document.execCommand('insertText', false, '\\n' + ${JSON.stringify(meta.description || '')});
+              ` : ''}
+              ${meta.tags && meta.tags.length > 0 ? `
+              var tags = ${JSON.stringify(meta.tags)};
+              for (var t = 0; t < tags.length; t++) {
+                document.execCommand('insertText', false, ' #' + tags[t]);
+              }
+              ` : ''}
+              editor.dispatchEvent(new Event('input', { bubbles: true }));
+              return { ok: true };
+            } catch(e) {}
+          }
+          return { ok: false };
+        })()
+      `);
+      console.log('[Auto Upload] 视频号编辑续接：填写结果', fillResult);
+      await sleep(1000);
+    }
+
+    // 封面修改
+    if (meta.cover_path) {
+      console.log('[Auto Upload] 视频号编辑续接：开始修改封面');
+
+      // 等待封面编辑按钮出现（视频预览图加载完成）
+      for (let i = 0; i < 45; i++) {
+        const found = await runInPage(`
+          (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var btn = iframes[i].contentDocument.querySelector('.edit-btn');
+                if (btn && btn.offsetParent) return true;
+              } catch(e) {}
+            }
+            return false;
+          })()
+        `);
+        if (found?.result === true) break;
+        await sleep(2000);
+      }
+      await sleep(3000);
+
+      // 复用上传流程的封面上传函数
+      async function editCoverUpload(editBtnSelector, label) {
+        const editResult = await chrome.runtime.sendMessage({
+          type: 'cdpClickIframe', selector: editBtnSelector,
+        });
+        console.log(`[Auto Upload] 编辑${label}:`, JSON.stringify(editResult));
+        if (!editResult?.ok) return false;
+
+        let addIconFound = false;
+        for (let i = 0; i < 5; i++) {
+          await sleep(1000);
+          const check = await runInPage(`
+            (function() {
+              var iframes = document.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                try {
+                  var doc = iframes[i].contentDocument;
+                  var dialog = doc.querySelector('.cover-set-footer');
+                  if (!dialog) continue;
+                  var els = doc.querySelectorAll('.add-icon');
+                  for (var j = 0; j < els.length; j++) {
+                    var r = els[j].getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return { found: true };
+                  }
+                  return { found: false, dialogOpen: true };
+                } catch(e) {}
+              }
+              return { found: false, dialogOpen: false };
+            })()
+          `);
+          if (check?.result?.found) { addIconFound = true; break; }
+          if (check?.result?.dialogOpen) break;
+        }
+
+        if (!addIconFound) {
+          await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.cover-tips' });
+          await sleep(3000);
+          for (let i = 0; i < 10; i++) {
+            await sleep(1000);
+            const check = await runInPage(`
+              (function() {
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                  try {
+                    var els = iframes[i].contentDocument.querySelectorAll('.add-icon');
+                    for (var j = 0; j < els.length; j++) {
+                      var r = els[j].getBoundingClientRect();
+                      if (r.width > 0 && r.height > 0) return true;
+                    }
+                  } catch(e) {}
+                }
+                return false;
+              })()
+            `);
+            if (check?.result === true) { addIconFound = true; break; }
+          }
+        }
+
+        const coverResult = await chrome.runtime.sendMessage({
+          type: 'setFileViaChooser', filePath: meta.cover_path, clickSelector: '.add-icon',
+        });
+        if (!coverResult?.ok) {
+          console.warn(`[Auto Upload] ${label}封面上传失败:`, coverResult?.error);
+          return false;
+        }
+        await sleep(3000);
+
+        await runInPage(`
+          (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var btn = iframes[i].contentDocument.querySelector('.cover-set-footer .weui-desktop-btn_primary');
+                if (btn) { btn.click(); return; }
+              } catch(e) {}
+            }
+          })()
+        `);
+        await sleep(2000);
+        return true;
+      }
+
+      await editCoverUpload('.vertical-img-wrap .edit-btn', '个人卡片');
+
+      const hasHorizon = await runInPage(`
+        (function() {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            try {
+              var el = iframes[i].contentDocument.querySelector('.horizon-img-wrap .edit-btn');
+              if (el && el.offsetParent) return true;
+            } catch(e) {}
+          }
+          return false;
+        })()
+      `);
+      if (hasHorizon?.result === true) {
+        await sleep(1000);
+        await editCoverUpload('.horizon-img-wrap .edit-btn', '分享卡片');
+      }
+      console.log('[Auto Upload] 视频号编辑续接：封面修改完成');
+    }
+
+    // 定时发布设置
+    if (meta.publish_time !== undefined) {
+      if (meta.publish_time === '' || meta.publish_time === null) {
+        await runInPage(`
+          var doc = document.querySelector('iframe')?.contentDocument;
+          var r = doc?.querySelector('.weui-desktop-form__radio[value="0"]');
+          if (r) r.click();
+        `);
+        console.log('[Auto Upload] 视频号编辑续接：已取消定时发布');
+        await sleep(500);
+      } else {
+        const [datePart, timePart] = meta.publish_time.split(' ');
+        const [, , targetDay] = datePart.split('-');
+        const [targetHour, targetMin] = timePart.split(':');
+        const dayNum = String(parseInt(targetDay, 10));
+        const hourStr = String(parseInt(targetHour, 10)).padStart(2, '0');
+        const minStr = String(parseInt(targetMin, 10)).padStart(2, '0');
+
+        await runInPage(`
+          var r = document.querySelector('iframe').contentDocument.querySelector('.weui-desktop-form__radio[value="1"]');
+          if (r) r.click();
+        `);
+        await sleep(1000);
+        await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-form__input[placeholder="请选择发表时间"]' });
+        await sleep(1000);
+        await runInPage(`(function() {
+          var doc = document.querySelector('iframe').contentDocument;
+          var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+          for (var i = 0; i < links.length; i++) {
+            var a = links[i];
+            if (a.classList.contains('weui-desktop-picker__disabled') || a.classList.contains('weui-desktop-picker__faded')) continue;
+            if (a.textContent.trim() === ${JSON.stringify(dayNum)}) { a.click(); break; }
+          }
+        })()`);
+        await sleep(500);
+        await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-picker__dt' });
+        await sleep(1000);
+        await runInPage(`(function() {
+          var doc = document.querySelector('iframe').contentDocument;
+          var hours = doc.querySelectorAll('.weui-desktop-picker__time__hour li');
+          for (var i = 0; i < hours.length; i++) {
+            if (hours[i].classList.contains('weui-desktop-picker__disabled')) continue;
+            if (hours[i].textContent.trim() === ${JSON.stringify(hourStr)}) {
+              hours[i].scrollIntoView({block:'center'});
+              hours[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+              hours[i].dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
+              hours[i].dispatchEvent(new MouseEvent('click',{bubbles:true}));
+              break;
+            }
+          }
+        })()`);
+        await sleep(500);
+        await runInPage(`(function() {
+          var doc = document.querySelector('iframe').contentDocument;
+          var mins = doc.querySelectorAll('.weui-desktop-picker__time__minute li');
+          for (var i = 0; i < mins.length; i++) {
+            if (mins[i].classList.contains('weui-desktop-picker__disabled')) continue;
+            if (mins[i].textContent.trim() === ${JSON.stringify(minStr)}) {
+              mins[i].scrollIntoView({block:'center'});
+              mins[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+              mins[i].dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
+              mins[i].dispatchEvent(new MouseEvent('click',{bubbles:true}));
+              break;
+            }
+          }
+        })()`);
+        await sleep(500);
+        await runInPage(`
+          var doc = document.querySelector('iframe').contentDocument;
+          var body = doc.querySelector('.form-btns') || doc.body;
+          if (body) body.click();
+        `);
+        await sleep(500);
+        console.log('[Auto Upload] 视频号编辑续接：定时发布已设置', meta.publish_time);
+      }
+    }
+
+    // 点击发布按钮
+    await runInPage(`(function() {
+      var doc = document.querySelector('iframe')?.contentDocument;
+      if (!doc) return;
+      var btn = doc.querySelector('.weui-desktop-btn_primary');
+      if (btn) btn.click();
+    })()`);
+    console.log('[Auto Upload] 视频号编辑续接：已点击发布按钮');
+    await sleep(2000);
+  }
+
+  async function channelsDeletePost(taskId, meta) {
+    const postIndex = parseInt(meta.post_id, 10);
+    if (isNaN(postIndex)) return { status: 'error', error: '缺少 post_id (index)' };
+
+    const indexInPage = await channelsNavigateToPage(postIndex);
+
+    // 强制显示操作区域 + 给删除按钮加临时 ID
+    const prepResult = await channelsRunInIframe(`
+      const rows = doc.querySelectorAll('.post-feed-item');
+      if (${indexInPage} >= rows.length) return { error: '索引超出范围' };
+      const row = rows[${indexInPage}];
+      const delIcon = row.querySelector('use[*|href="#icon-feed-del"]');
+      if (!delIcon) return { error: '找不到删除按钮' };
+      const opr = row.querySelector('.opr');
+      if (opr) opr.style.cssText = 'opacity:1 !important; visibility:visible !important; display:flex !important;';
+      row.querySelectorAll('.opr-item-wrap').forEach(function(el) {
+        el.style.cssText = 'opacity:1 !important; visibility:visible !important; display:flex !important;';
+      });
+      const delBtn = delIcon.closest('.opr-item') || delIcon.closest('.opr-item-wrap');
+      delBtn.id = '__channels_del_tmp';
+      row.scrollIntoView({ block: 'center' });
+      return { ok: true };
+    `);
+    if (prepResult?.error) return { status: 'error', error: prepResult.error };
+    await sleep(500);
+
+    await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '#__channels_del_tmp' });
+    await sleep(1500);
+
+    // 清理临时 ID
+    await channelsRunInIframe(`
+      const el = doc.getElementById('__channels_del_tmp');
+      if (el) el.id = '';
+      return true;
+    `);
+
+    // 确认删除弹窗（精确匹配 .weui-desktop-dialog 内的确定按钮）
+    // 等待弹窗出现
+    await sleep(500);
+    const confirmResult = await chrome.runtime.sendMessage({
+      type: 'runInPage',
+      expression: `(function() {
+        // 查找删除确认弹窗（标题包含"删除"的 dialog）
+        const dialogs = document.querySelectorAll('.weui-desktop-dialog');
+        for (const dialog of dialogs) {
+          if (dialog.offsetParent === null && !dialog.closest('[style*="display: none"]') === false) continue;
+          const title = dialog.querySelector('.weui-desktop-dialog__title');
+          if (!title || !title.textContent.includes('删除')) continue;
+          const btn = dialog.querySelector('.weui-desktop-btn_primary');
+          if (btn) { btn.click(); return { ok: true }; }
+        }
+        // fallback: iframe 中查找
+        const iframes = document.querySelectorAll('iframe');
+        for (const iframe of iframes) {
+          try {
+            const doc = iframe.contentDocument;
+            if (!doc) continue;
+            const idialogs = doc.querySelectorAll('.weui-desktop-dialog');
+            for (const dialog of idialogs) {
+              const title = dialog.querySelector('.weui-desktop-dialog__title');
+              if (!title || !title.textContent.includes('删除')) continue;
+              const btn = dialog.querySelector('.weui-desktop-btn_primary');
+              if (btn) { btn.click(); return { ok: true }; }
+            }
+          } catch(e) {}
+        }
+        return { ok: false };
+      })()`
+    });
+    if (confirmResult?.result?.ok) {
+      console.log('[Auto Upload] 视频号删除：已确认删除');
+      await sleep(1000);
+      return { status: 'ok' };
+    }
+
+    return { status: 'error', error: '未找到删除确认按钮' };
+  }
+
+  // -------------------------------------------------------------------------
+  // 轮询主循环
   // -------------------------------------------------------------------------
 
   let _running = false;
