@@ -39,10 +39,20 @@ def login(platform: str, account_id: str) -> dict:
 
 
 @mcp.tool()
+def logout(platform: str, account_id: str) -> dict:
+    """
+    退出登录，删除本地 session。
+    返回 {"status": "ok", "message": "..."}
+    """
+    return tools.logout(platform, account_id)
+
+
+@mcp.tool()
 def check_login(platform: str, account_id: str) -> dict:
     """
     轮询扫码登录状态。login() 返回 qr_required 后每隔几秒调用一次。
-    返回 status: pending | scanned | confirmed | expired
+    返回 status: pending | confirmed | qr_refreshed | error
+    qr_refreshed 表示二维码已自动刷新，需重新展示给用户。
     """
     return tools.check_login(platform, account_id)
 

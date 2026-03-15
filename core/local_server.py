@@ -36,6 +36,14 @@ _login_request_lock = threading.Lock()
 _login_state: dict = {}
 _login_state_lock = threading.Lock()
 
+# 退出登录请求 {account_id, platform, domain}
+_logout_request: Optional[dict] = None
+_logout_request_lock = threading.Lock()
+
+# 退出登录结果 account_id → {status, removed}
+_logout_state: dict = {}
+_logout_state_lock = threading.Lock()
+
 # 管理操作结果 {task_id: dict}
 _manage_results: dict[str, dict] = {}
 _manage_results_lock = threading.Lock()
@@ -114,6 +122,15 @@ class _Handler(BaseHTTPRequestHandler):
                 global _login_request
                 req = _login_request
                 _login_request = None
+            self._json(req if req else {})
+            return
+
+        # GET /logout_request → 消费一次，之后返回 {}
+        if path == "/logout_request":
+            with _logout_request_lock:
+                global _logout_request
+                req = _logout_request
+                _logout_request = None
             self._json(req if req else {})
             return
 
@@ -219,7 +236,7 @@ class _Handler(BaseHTTPRequestHandler):
             status = body.get("status", "")
             if account_id and status:
                 state: dict = {"status": status}
-                if status == "qr_required":
+                if status in ("qr_required", "qr_refreshed"):
                     qr_base64 = body.get("qr_base64", "")
                     qr_url = body.get("qr_url", "")
                     qr_dir = BASE_DIR / "tmp"
@@ -243,10 +260,20 @@ class _Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     state["qr_path"] = qr_path if saved else ""
+                    state["qr_base64"] = body.get("qr_base64", "")
                 elif "error" in body:
                     state["error"] = body.get("error", "")
                 with _login_state_lock:
                     _login_state[account_id] = state
+            self._json({"ok": True})
+            return
+
+        # POST /logout_status — 插件回报退出登录结果
+        if path == "/logout_status":
+            account_id = body.get("account_id", "")
+            if account_id:
+                with _logout_state_lock:
+                    _logout_state[account_id] = body
             self._json({"ok": True})
             return
 
@@ -309,6 +336,21 @@ def clear_login_state(account_id: str):
     """清除登录状态（下次重新检测）"""
     with _login_state_lock:
         _login_state.pop(account_id, None)
+
+
+def set_logout_request(account_id: str, platform: str, domain: str):
+    """Python 触发退出登录请求"""
+    global _logout_request
+    with _logout_request_lock:
+        _logout_request = {"account_id": account_id, "platform": platform, "domain": domain}
+    with _logout_state_lock:
+        _logout_state.pop(account_id, None)
+
+
+def get_logout_state(account_id: str) -> dict:
+    """返回退出登录结果，无记录返回 {}"""
+    with _logout_state_lock:
+        return dict(_logout_state.get(account_id, {}))
 
 
 def get_manage_result(task_id: str) -> Optional[dict]:

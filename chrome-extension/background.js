@@ -225,24 +225,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 再用 Input.dispatchMouseEvent 模拟真实点击（支持 iframe 内元素）
         const { result: coordResult } = await sendCommand(tabId, 'Runtime.evaluate', {
           expression: `(function(sel) {
-            function findEl(doc, offsetX, offsetY) {
+            function findEl(doc, offsetX, offsetY, frame) {
               var els = doc.querySelectorAll(sel);
               for (var j = 0; j < els.length; j++) {
                 var r = els[j].getBoundingClientRect();
                 if (r.width > 0 && r.height > 0) {
-                  return { x: r.left + r.width / 2 + offsetX, y: r.top + r.height / 2 + offsetY };
+                  // 先滚动元素到可视区域，再重新获取坐标
+                  els[j].scrollIntoView({ block: 'center', behavior: 'instant' });
+                  if (frame) frame.scrollIntoView({ block: 'center', behavior: 'instant' });
+                  r = els[j].getBoundingClientRect();
+                  var fRect = frame ? frame.getBoundingClientRect() : { left: 0, top: 0 };
+                  return { x: r.left + r.width / 2 + fRect.left, y: r.top + r.height / 2 + fRect.top };
                 }
               }
               return null;
             }
-            var pos = findEl(document, 0, 0);
+            var pos = findEl(document, 0, 0, null);
             if (pos) return pos;
             var frames = document.querySelectorAll('iframe');
             for (var i = 0; i < frames.length; i++) {
               try {
                 var fr = frames[i];
-                var fRect = fr.getBoundingClientRect();
-                pos = findEl(fr.contentDocument, fRect.left, fRect.top);
+                pos = findEl(fr.contentDocument, 0, 0, fr);
                 if (pos) return pos;
               } catch(e) {}
             }
@@ -345,24 +349,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await attachDebugger(tabId);
         const { result: coordResult } = await sendCommand(tabId, 'Runtime.evaluate', {
           expression: `(function(sel) {
-            function findEl(doc, offsetX, offsetY) {
+            function findEl(doc, offsetX, offsetY, frame) {
               var els = doc.querySelectorAll(sel);
               for (var j = 0; j < els.length; j++) {
                 var r = els[j].getBoundingClientRect();
                 if (r.width > 0 && r.height > 0) {
-                  return { x: r.left + r.width / 2 + offsetX, y: r.top + r.height / 2 + offsetY };
+                  // 先滚动元素到可视区域，再重新获取坐标
+                  els[j].scrollIntoView({ block: 'center', behavior: 'instant' });
+                  if (frame) frame.scrollIntoView({ block: 'center', behavior: 'instant' });
+                  r = els[j].getBoundingClientRect();
+                  var fRect = frame ? frame.getBoundingClientRect() : { left: 0, top: 0 };
+                  return { x: r.left + r.width / 2 + fRect.left, y: r.top + r.height / 2 + fRect.top };
                 }
               }
               return null;
             }
-            var pos = findEl(document, 0, 0);
+            var pos = findEl(document, 0, 0, null);
             if (pos) return pos;
             var frames = document.querySelectorAll('iframe');
             for (var i = 0; i < frames.length; i++) {
               try {
                 var fr = frames[i];
-                var fRect = fr.getBoundingClientRect();
-                pos = findEl(fr.contentDocument, fRect.left, fRect.top);
+                pos = findEl(fr.contentDocument, 0, 0, fr);
                 if (pos) return pos;
               } catch(e) {}
             }
@@ -529,7 +537,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (width > 0 && height > 0) clip = { x, y, width, height, scale: 1 };
         }
 
-        const screenshotParams = { format: 'png' };
+        const screenshotParams = { format: 'png', captureBeyondViewport: true };
         if (clip) screenshotParams.clip = clip;
         const result = await sendCommand(tabId, 'Page.captureScreenshot', screenshotParams);
         await new Promise(res => chrome.debugger.detach({ tabId }, res));
@@ -542,10 +550,85 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // closeTab: 操作完成后关闭当前标签页
+  // clearCookies: 清除指定域名下的所有 cookie
+  if (msg.type === 'clearCookies') {
+    const domain = msg.domain;
+    (async () => {
+      try {
+        // 用多种方式获取 cookie，确保覆盖全面
+        const allCookies = new Map();
+        // 方式1: 按 domain 查（精确匹配）
+        for (const c of await chrome.cookies.getAll({ domain })) {
+          allCookies.set(`${c.domain}|${c.name}|${c.path}`, c);
+        }
+        // 方式2: 按 domain 加点前缀查
+        for (const c of await chrome.cookies.getAll({ domain: '.' + domain })) {
+          allCookies.set(`${c.domain}|${c.name}|${c.path}`, c);
+        }
+        // 方式3: 按 url 查（最可靠）
+        for (const c of await chrome.cookies.getAll({ url: `https://${domain}` })) {
+          allCookies.set(`${c.domain}|${c.name}|${c.path}`, c);
+        }
+        // 方式4: 带 creator/channels 子域名查
+        const subdomains = ['creator.', 'channels.', 'www.'];
+        for (const sub of subdomains) {
+          try {
+            for (const c of await chrome.cookies.getAll({ url: `https://${sub}${domain}` })) {
+              allCookies.set(`${c.domain}|${c.name}|${c.path}`, c);
+            }
+          } catch (_) {}
+        }
+
+        let removed = 0;
+        for (const cookie of allCookies.values()) {
+          const protocol = cookie.secure ? 'https' : 'http';
+          const url = `${protocol}://${cookie.domain.replace(/^\./, '')}${cookie.path}`;
+          await chrome.cookies.remove({ url, name: cookie.name });
+          removed++;
+        }
+        console.log(`[Auto Upload] 已清除 ${domain} 的 ${removed} 个 cookie`);
+        sendResponse({ ok: true, removed });
+      } catch (e) {
+        console.error('[Auto Upload] 清除 cookie 失败:', e);
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // closeTab: 操作完成后关闭当前标签页（先移除 beforeunload 防止弹窗）
   if (msg.type === 'closeTab') {
     if (sender.tab && sender.tab.id) {
-      chrome.tabs.remove(sender.tab.id);
+      const tabId = sender.tab.id;
+      (async () => {
+        // 1. 清除 onbeforeunload 属性
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            func: () => { window.onbeforeunload = null; },
+          });
+        } catch (_) {}
+
+        // 2. 用 CDP 自动处理 beforeunload 弹窗（防止 addEventListener 注册的监听器）
+        try {
+          await attachDebugger(tabId);
+          await sendCommand(tabId, 'Page.enable', {});
+          // 监听弹窗并自动确认离开
+          const dialogHandler = (source, method, params) => {
+            if (source.tabId !== tabId || method !== 'Page.javascriptDialogOpening') return;
+            sendCommand(tabId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+          };
+          chrome.debugger.onEvent.addListener(dialogHandler);
+          // 关闭标签页，如果弹窗出现会被自动处理
+          chrome.tabs.remove(tabId, () => {
+            chrome.debugger.onEvent.removeListener(dialogHandler);
+            chrome.debugger.detach({ tabId }, () => {});
+          });
+        } catch (_) {
+          // CDP 失败时直接关闭
+          chrome.tabs.remove(tabId);
+        }
+      })();
     }
     return false;
   }

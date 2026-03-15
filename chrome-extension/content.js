@@ -88,8 +88,13 @@
     }
     if (platform === 'channels') {
       if (location.pathname.includes('/login')) return true;
-      return !!(document.querySelector('[class*="qrcode-wrap"], [class*="login-qrcode"]') ||
+      // 检测 .login-content 是否还可见（登录成功后会消失或隐藏）
+      const loginContent = document.querySelector('.login-content');
+      if (loginContent && loginContent.offsetParent !== null) return true;
+      // 兜底：检测 QR 相关元素
+      const hasQr = !!(document.querySelector('[class*="qrcode-wrap"], [class*="login-qrcode"]') ||
                 Array.from(document.querySelectorAll('span,div')).some(el => el.childElementCount === 0 && (el.textContent || '').includes('微信扫码登录')));
+      return hasQr;
     }
     return location.pathname.includes('/login');
   }
@@ -106,33 +111,91 @@
 
   // 小红书登录
   async function checkAndHandleXhsLogin(accountId) {
-    // 尝试切换到二维码模式
-    const qrSwitchBtn = document.querySelector('.login-box-container img:first-child');
-    if (qrSwitchBtn) { qrSwitchBtn.click(); await sleep(1500); }
+    // 重试获取二维码：点击切换 → 等待 QR 渲染 → 校验 base64 长度
+    // 真正的二维码 data:image 长度一般 > 1000，图标通常 < 500
+    const QR_MIN_LENGTH = 1000;
+    let qrBase64 = '';
 
-    // 取 src 最长的 data:image（QR 远大于小图标）
-    await sleep(2000);
-    const allDataImgs = Array.from(document.querySelectorAll('img[src^="data:image"]'));
-    const qrImg = allDataImgs.sort((a, b) => b.src.length - a.src.length)[0];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      // 每次重试都尝试点击切换到二维码模式
+      const qrSwitchBtn = document.querySelector('.login-box-container img:first-child');
+      if (qrSwitchBtn) { qrSwitchBtn.click(); }
+      await sleep(2000 + attempt * 1000);  // 逐次多等一点
+
+      const allDataImgs = Array.from(document.querySelectorAll('img[src^="data:image"]'));
+      const qrImg = allDataImgs.sort((a, b) => b.src.length - a.src.length)[0];
+      if (qrImg && qrImg.src.length > QR_MIN_LENGTH) {
+        qrBase64 = qrImg.src;
+        console.log(`[Auto Upload] 小红书 QR 获取成功 (第 ${attempt + 1} 次, 长度: ${qrBase64.length})`);
+        break;
+      }
+      console.log(`[Auto Upload] 小红书 QR 第 ${attempt + 1} 次未取到有效二维码, 最大图片长度: ${qrImg ? qrImg.src.length : 0}`);
+    }
+
     await postJSON('/login_status', {
       account_id: accountId,
       status: 'qr_required',
-      qr_base64: qrImg ? qrImg.src : '',
+      qr_base64: qrBase64,
     });
 
     localStorage.setItem(LOGIN_PENDING_KEY, accountId);
-    const deadline = Date.now() + 3 * 60 * 1000;
+    const QR_TIMEOUT = 60 * 1000;  // 60 秒未扫码就报超时
+    const deadline = Date.now() + QR_TIMEOUT;
     while (Date.now() < deadline) {
       await sleep(2000);
       if (!isOnLoginPage()) {
         localStorage.removeItem(LOGIN_PENDING_KEY);
         await postJSON('/login_status', { account_id: accountId, status: 'confirmed' });
+        await sleep(500);
+        chrome.runtime.sendMessage({ type: 'closeTab' });
         return true;
       }
     }
     localStorage.removeItem(LOGIN_PENDING_KEY);
-    await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'QR 超时' });
+    await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'qr_timeout' });
+    await sleep(500);
+    chrome.runtime.sendMessage({ type: 'closeTab' });
     return false;
+  }
+
+  // 视频号：截取二维码区域
+  async function captureChannelsQr() {
+    const allContents = Array.from(document.querySelectorAll('.login-content'));
+    const vw = window.innerWidth;
+    const loginContent = allContents.reduce((best, el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return best;
+      const cx = r.left + r.width / 2;
+      if (!best) return el;
+      const br = best.getBoundingClientRect();
+      const bestCx = br.left + br.width / 2;
+      return Math.abs(cx - vw / 2) < Math.abs(bestCx - vw / 2) ? el : best;
+    }, null);
+    let clip;
+    if (loginContent) {
+      loginContent.scrollIntoView({ block: 'center', behavior: 'instant' });
+      await sleep(300);
+      const r = loginContent.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        clip = {
+          x: r.left + window.scrollX,
+          y: r.top + window.scrollY,
+          width: r.width,
+          height: r.height,
+        };
+        console.log('[Auto Upload] 截图区域 .login-content:', clip);
+      }
+    } else {
+      console.warn('[Auto Upload] 未找到 .login-content，将截全图');
+    }
+    const shot = await chrome.runtime.sendMessage({ type: 'captureScreenshot', ...(clip && { clip }) });
+    const qr_base64 = shot?.ok ? shot.dataUrl : '';
+    if (!qr_base64) {
+      console.warn('[Auto Upload] 视频号截图失败:', shot?.error);
+    } else {
+      console.log('[Auto Upload] 视频号截图成功，长度:', qr_base64.length);
+    }
+    return qr_base64;
   }
 
   // 视频号登录
@@ -149,42 +212,7 @@
     console.log('[Auto Upload] login-content 已出现，等待 QR iframe 渲染...');
     await sleep(5000);
 
-    // 重新取坐标 —— 找水平最居中的那个（carousel 里有多个 .login-content）
-    const allContents = Array.from(document.querySelectorAll('.login-content'));
-    const vw = window.innerWidth;
-    loginContent = allContents.reduce((best, el) => {
-      const r = el.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) return best;
-      const cx = r.left + r.width / 2;
-      if (!best) return el;
-      const br = best.getBoundingClientRect();
-      const bestCx = br.left + br.width / 2;
-      return Math.abs(cx - vw / 2) < Math.abs(bestCx - vw / 2) ? el : best;
-    }, null);
-    let clip;
-    if (loginContent) {
-      const r = loginContent.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) {
-        // getBoundingClientRect 是视口坐标，CDP clip 需要页面坐标（加上滚动偏移）
-        clip = {
-          x: r.left + window.scrollX,
-          y: r.top + window.scrollY,
-          width: r.width,
-          height: r.height,
-        };
-        console.log('[Auto Upload] 截图区域 .login-content:', clip, 'scroll:', window.scrollX, window.scrollY);
-      }
-    } else {
-      console.warn('[Auto Upload] 未找到 .login-content，将截全图');
-    }
-    const shot = await chrome.runtime.sendMessage({ type: 'captureScreenshot', ...(clip && { clip }) });
-    const qr_base64 = shot?.ok ? shot.dataUrl : '';
-    if (!qr_base64) {
-      console.warn('[Auto Upload] 视频号截图失败:', shot?.error);
-    } else {
-      console.log('[Auto Upload] 视频号截图成功，长度:', qr_base64.length);
-    }
-
+    const qr_base64 = await captureChannelsQr();
     await postJSON('/login_status', {
       account_id: accountId,
       status: 'qr_required',
@@ -193,7 +221,8 @@
     });
 
     localStorage.setItem(LOGIN_PENDING_KEY, accountId);
-    const deadline = Date.now() + 3 * 60 * 1000;
+    const QR_TIMEOUT = 60 * 1000;  // 60 秒未扫码就报超时
+    const deadline = Date.now() + QR_TIMEOUT;
     while (Date.now() < deadline) {
       await sleep(2000);
 
@@ -201,22 +230,25 @@
       if (!isOnLoginPage()) {
         localStorage.removeItem(LOGIN_PENDING_KEY);
         await postJSON('/login_status', { account_id: accountId, status: 'confirmed' });
+        await sleep(500);
+        chrome.runtime.sendMessage({ type: 'closeTab' });
         return true;
       }
 
-      // 二维码过期：显示了"已过期"遮罩
+      // 二维码过期：立即报超时，让 Python 层重试
       const expired = Array.from(document.querySelectorAll('.qrcode-wrap .mask')).find(
         m => m.offsetParent && (m.innerText || '').includes('已过期')
       );
       if (expired) {
-        localStorage.removeItem(LOGIN_PENDING_KEY);
-        await postJSON('/login_status', { account_id: accountId, status: 'error', error: '二维码已过期，请重新调用 login()' });
-        return false;
+        console.log('[Auto Upload] 视频号二维码已过期');
+        break;
       }
     }
 
     localStorage.removeItem(LOGIN_PENDING_KEY);
-    await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'QR 超时' });
+    await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'qr_timeout' });
+    // 关闭当前标签页，Python 层会打开新的
+    chrome.runtime.sendMessage({ type: 'closeTab' });
     return false;
   }
 
@@ -469,34 +501,78 @@
 
       // 8.5 上传封面图
       if (meta && meta.cover_path) {
+        // 等待视频转码完成：.stage .spin 存在说明还在转码，消失说明完成
+        await postJSON('/progress', { task_id, progress: 81, msg: '等待视频转码完成...' });
+        const transcodeTimeout = 5 * 60 * 1000;  // 最多等 5 分钟
+        const transcodeStart = Date.now();
+        while (Date.now() - transcodeStart < transcodeTimeout) {
+          const spinning = document.querySelector('.stage .spin');
+          const stageText = document.querySelector('.stage')?.textContent || '';
+          if (!spinning && !stageText.includes('转码中')) {
+            console.log('[Auto Upload] 视频转码完成');
+            break;
+          }
+          // 上报转码进度
+          const speedMatch = stageText.match(/当前速度：([\d.]+\S+)/);
+          const remainMatch = stageText.match(/剩余时间：(\S+)/);
+          const msg = `转码中${speedMatch ? ' ' + speedMatch[1] : ''}${remainMatch ? ' 剩余' + remainMatch[1] : ''}`;
+          await postJSON('/progress', { task_id, progress: 81, msg });
+          await sleep(3000);
+        }
+        await sleep(1000);
+
         await postJSON('/progress', { task_id, progress: 82, msg: '准备上传封面' });
 
-        // Step 1: 滚到封面区域，点击 operator 展开上传面板
-        const coverOperator = document.querySelector('.cover-plugin-preview .operator') ||
-                              document.querySelector('.cover-plugin-preview [class*="operator"]');
-        if (coverOperator) {
-          coverOperator.scrollIntoView({ block: 'center' });
-          await sleep(500);
-          coverOperator.click();
-          await sleep(1500);
-        }
+        // Step 1: 滚到封面区域，点击 operator 展开上传面板（带重试）
+        let coverUploaded = false;
+        for (let coverAttempt = 0; coverAttempt < 3 && !coverUploaded; coverAttempt++) {
+          if (coverAttempt > 0) {
+            console.log(`[Auto Upload] 封面上传第 ${coverAttempt + 1} 次重试`);
+            await sleep(2000);
+          }
 
-        // Step 2: 确保 .upload-btn 可见后再拦截
-        const uploadBtn = document.querySelector('.upload-btn');
-        if (uploadBtn) {
+          const coverOperator = document.querySelector('.cover-plugin-preview .operator') ||
+                                document.querySelector('.cover-plugin-preview [class*="operator"]');
+          if (coverOperator) {
+            coverOperator.scrollIntoView({ block: 'center' });
+            await sleep(500);
+            coverOperator.click();
+            await sleep(2000);
+          }
+
+          // Step 2: 等待 .upload-btn 出现并可见
+          let uploadBtn = null;
+          for (let i = 0; i < 10; i++) {
+            uploadBtn = document.querySelector('.upload-btn');
+            if (uploadBtn && uploadBtn.offsetParent !== null) break;
+            await sleep(500);
+          }
+          if (!uploadBtn) {
+            console.warn('[Auto Upload] 封面上传按钮未出现，重试...');
+            continue;
+          }
           uploadBtn.scrollIntoView({ block: 'center' });
           await sleep(400);
+
+          const coverResult = await chrome.runtime.sendMessage({
+            type: 'interceptAndSetFile',
+            filePath: meta.cover_path,
+            clickSelector: '.upload-btn',
+          });
+          if (coverResult && coverResult.ok) {
+            coverUploaded = true;
+          } else {
+            console.warn(`[Auto Upload] 封面上传失败 (第 ${coverAttempt + 1} 次):`, coverResult?.error);
+          }
         }
 
-        const coverResult = await chrome.runtime.sendMessage({
-          type: 'interceptAndSetFile',
-          filePath: meta.cover_path,
-          clickSelector: '.upload-btn',
-        });
-        if (!coverResult || !coverResult.ok) {
-          console.warn('[Auto Upload] 封面上传失败:', coverResult?.error);
+        if (!coverUploaded) {
+          console.warn('[Auto Upload] 封面上传最终失败，跳过封面设置');
+          await postJSON('/progress', { task_id, progress: 84, msg: '封面上传失败，已跳过' });
         }
 
+        // 以下步骤仅在封面上传成功时执行
+        if (coverUploaded) {
         // 等待 Zeus 引擎加载封面（封面上传后需要一段时间渲染）
         await sleep(3000);
 
@@ -609,17 +685,23 @@
           console.warn('[Auto Upload] 未找到封面确认按钮，当前可见按钮:', allVisibleBtns);
           await postJSON('/progress', { task_id, progress: 84, msg: '封面已上传（未找到保存按钮: ' + allVisibleBtns.join('/') + '）' });
         }
+        } // end if (coverUploaded)
       }
 
       // 8.6 定时发布
       if (meta && meta.publish_time) {
         await postJSON('/progress', { task_id, progress: 85, msg: '设置定时发布' });
 
-        // publish_time 格式: "2026-03-16 08:00"
+        // publish_time 格式: "2026-03-16 08:00" 或 "2026-3-20 8:01"
         const [datePart, timePart] = meta.publish_time.split(' ');
-        const [, , targetDay]  = datePart.split('-');   // "16"
-        const [targetHour, targetMin] = timePart.split(':'); // "08", "00"
-        const targetDayNum = String(parseInt(targetDay, 10));
+        const [, , rawDay]  = datePart.split('-');
+        const [rawHour, rawMin] = timePart.split(':');
+        // 补零
+        const targetDay = rawDay.padStart(2, '0');
+        const targetHour = rawHour.padStart(2, '0');
+        const targetMin = rawMin.padStart(2, '0');
+        const targetDayNum = String(parseInt(rawDay, 10));
+        console.log(`[Auto Upload] 定时发布: 日=${targetDay} 时=${targetHour} 分=${targetMin}`);
 
         // 辅助：scrollIntoView 后 CDP 点击（解决滚动容器坐标偏移）
         async function cdpClickEl(el) {
@@ -633,92 +715,106 @@
         }
 
         // Step 0: 等待定时发布开关出现，并激活
-        // 用 .d-switch-simulator 的 unchecked class 判断状态（Vue checkbox .checked 属性不可靠）
+        // 精确找到包含"定时发布"文字的 .custom-switch-card
+        let scheduleCard = null;
         let scheduleSwitch = null;
         for (let i = 0; i < 10; i++) {
-          scheduleSwitch = document.querySelector('.post-time-wrapper .d-switch-simulator');
-          if (scheduleSwitch) break;
+          const cards = Array.from(document.querySelectorAll('.custom-switch-card'));
+          scheduleCard = cards.find(card => (card.textContent || '').includes('定时发布'));
+          if (scheduleCard) {
+            scheduleSwitch = scheduleCard.querySelector('.d-switch-simulator');
+            if (scheduleSwitch) break;
+          }
           await sleep(500);
         }
-        const isUnchecked = scheduleSwitch?.classList.contains('unchecked');
-        if (scheduleSwitch && isUnchecked) {
+        if (scheduleSwitch && scheduleSwitch.classList.contains('unchecked')) {
           scheduleSwitch.scrollIntoView({ block: 'center' });
           await sleep(600);
-          scheduleSwitch.click();
+          const swId0 = '__au_sw0_' + Date.now();
+          scheduleSwitch.id = swId0;
+          await chrome.runtime.sendMessage({ type: 'cdpClick', selector: `#${swId0}` });
+          scheduleSwitch.id = '';
           await sleep(1500);
+          console.log('[Auto Upload] 定时发布开关已开启');
         }
 
-        // Step A: 等待日期输入框出现并 CDP 点击打开弹窗
+        // 直接在日期输入框里填入时间值（避免打开选择器误触开关）
+        const fullDateTime = `${datePart.replace(/\b(\d)\b/g, '0$1')} ${targetHour}:${targetMin}`;
         let dtInput = null;
-        for (let i = 0; i < 8; i++) {
-          dtInput = document.querySelector('.d-datepicker input');
+        for (let i = 0; i < 10; i++) {
+          dtInput = document.querySelector('.d-datepicker input, .d-datepicker-input-filter input');
           if (dtInput) break;
           await sleep(500);
         }
         if (dtInput) {
-          await cdpClickEl(dtInput);
-          await sleep(800);
-
-          // Step B: 等弹窗出现
-          let popover = null;
-          for (let i = 0; i < 10; i++) {
-            popover = document.querySelector('.post-time-date-picker-popover-class');
-            if (popover) break;
-            await sleep(300);
-          }
-          if (popover) {
-            // Step C: 点击目标日期
-            const dayCells = Array.from(popover.querySelectorAll('.d-datepicker-cell.d-clickable:not(.disabled)'));
-            const dayCell = dayCells.find(c =>
-              (c.querySelector('span.d-text-monospace') || c.querySelector('span') || c).textContent.trim() === targetDayNum
-            );
-            if (dayCell) { await cdpClickEl(dayCell); await sleep(600); }
-
-            // Step D: 点击小时 + 分钟
-            const timeBars = Array.from(popover.querySelectorAll('.d-timepicker-timebar'));
-            async function clickTimeItem(bar, target) {
-              const item = Array.from(bar.querySelectorAll('.d-timepicker-time')).find(el =>
-                (el.querySelector('span.d-text-monospace') || el.querySelector('span') || el).textContent.trim() === target
-              );
-              if (item) { await cdpClickEl(item); }
-            }
-            if (timeBars[0]) await clickTimeItem(timeBars[0], targetHour);
-            if (timeBars[1]) await clickTimeItem(timeBars[1], targetMin);
-          }
+          dtInput.focus();
+          await sleep(300);
+          // 用 React/Vue 兼容方式设值
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          nativeSetter.call(dtInput, fullDateTime);
+          dtInput.dispatchEvent(new Event('input', { bubbles: true }));
+          dtInput.dispatchEvent(new Event('change', { bubbles: true }));
+          // 模拟回车确认
+          dtInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+          await sleep(500);
+          dtInput.blur();
+          await sleep(500);
+          console.log(`[Auto Upload] 定时发布时间已填入: ${fullDateTime}`);
+        } else {
+          console.warn('[Auto Upload] 未找到日期输入框');
         }
 
-        await sleep(500);
         await postJSON('/progress', { task_id, progress: 87, msg: `定时发布已设置: ${meta.publish_time}` });
-        await sleep(1000);
+        await sleep(500);
       }
 
-      // 9. 点击发布按钮
-      let published = false;
-
-      // 优先尝试指定选择器
-      const publishBtn = document.querySelector('.publish-page-publish-btn button');
-      if (publishBtn) {
-        publishBtn.removeAttribute('disabled');
-        publishBtn.click();
-        published = true;
-      }
-
-      // fallback：遍历所有按钮找含"发布"文字的
-      if (!published) {
-        const allBtns = Array.from(document.querySelectorAll('button'));
-        for (const btn of allBtns) {
-          const text = (btn.innerText || btn.textContent || '').trim();
-          if (text.includes('发布') && !text.includes('草稿')) {
-            btn.removeAttribute('disabled');
-            btn.click();
-            published = true;
+      // 发布前最终确认：如果是定时发布，确保开关开着（用 CDP 点击确保生效）
+      const isScheduled = !!(meta && meta.publish_time);
+      if (isScheduled) {
+        // 循环检测并修复开关状态，最多重试 3 次
+        for (let swRetry = 0; swRetry < 3; swRetry++) {
+          const fCards = Array.from(document.querySelectorAll('.custom-switch-card'));
+          const fCard = fCards.find(c => (c.textContent || '').includes('定时发布'));
+          const fSwitch = fCard?.querySelector('.d-switch-simulator');
+          if (!fSwitch || fSwitch.classList.contains('checked')) {
+            console.log('[Auto Upload] 定时开关状态正常 (checked)');
             break;
           }
+          console.log(`[Auto Upload] 发布前检测到定时开关关闭，第 ${swRetry + 1} 次重新开启`);
+          // 用 CDP 点击开关
+          fSwitch.scrollIntoView({ block: 'center' });
+          await sleep(300);
+          const swId = '__au_sw_' + Date.now();
+          fSwitch.id = swId;
+          await chrome.runtime.sendMessage({ type: 'cdpClick', selector: `#${swId}` });
+          fSwitch.id = '';
+          await sleep(1500);
+        }
+      }
+
+      let published = false;
+      const targetBtnText = isScheduled ? '定时发布' : '发布';
+
+      // 精确匹配：排除开关区域内的按钮
+      const allBtns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent);
+      for (const btn of allBtns) {
+        // 排除在 .custom-switch-card 内的按钮（那是开关不是发布按钮）
+        if (btn.closest('.custom-switch-card')) continue;
+        const text = (btn.innerText || btn.textContent || '').trim();
+        if (text === targetBtnText) {
+          btn.removeAttribute('disabled');
+          btn.click();
+          published = true;
+          console.log(`[Auto Upload] 点击「${targetBtnText}」按钮`);
+          break;
         }
       }
 
       if (!published) {
-        throw new Error('未找到发布按钮');
+        const finalBtns = allBtns
+          .map(b => (b.innerText || '').trim())
+          .filter(t => t);
+        throw new Error(`未找到「${targetBtnText}」按钮，页面按钮: [${finalBtns.join(', ')}]`);
       }
       await postJSON('/progress', { task_id, progress: 90, msg: '已点击发布按钮' });
 
@@ -755,29 +851,39 @@
     try {
       await postJSON('/progress', { task_id, progress: 5, msg: '视频号：页面准备中' });
 
-      // Step 1: 等页面稳定
-      await sleep(2000);
+      // Step 1: 等页面稳定（Vue 组件 unmount/remount 需要时间）
+      await sleep(3000);
 
-      // Step 2: 向 iframe 内的隐藏 file input 注入文件
+      // Step 2: 向 iframe 内的隐藏 file input 注入文件（带重试，等元素出现）
       await postJSON('/progress', { task_id, progress: 10, msg: '视频号：注入视频文件' });
-      const setResult = await chrome.runtime.sendMessage({
-        type: 'setFileInput',
-        filePath: task.file_path,
-        selector: 'input[type="file"]',
-      });
+      let setResult = null;
+      for (let fileAttempt = 0; fileAttempt < 15; fileAttempt++) {
+        setResult = await chrome.runtime.sendMessage({
+          type: 'setFileInput',
+          filePath: task.file_path,
+          selector: 'input[type="file"]',
+        });
+        if (setResult && setResult.ok) break;
+        console.log(`[Auto Upload] 视频号 file input 未找到 (第${fileAttempt + 1}次)，等待...`);
+        await sleep(2000);
+      }
       if (!setResult || !setResult.ok) throw new Error('视频注入失败: ' + (setResult?.error || '未知'));
 
-      // Step 3: 等待上传完成（在页面 JS 上下文检查 iframe 里的表单）
+      // Step 3: 等待上传完成（用 runInPage 检测 iframe 内编辑器，间隔 5 秒减少 CDP 压力）
       await postJSON('/progress', { task_id, progress: 15, msg: '视频号：等待上传完成' });
       const uploadTimeout = 10 * 60 * 1000;
       const uploadStart = Date.now();
       let editorVisible = false;
       while (Date.now() - uploadStart < uploadTimeout) {
-        await sleep(2000);
-        const r = await runInPage(
-          `!!(document.querySelector('iframe') && document.querySelector('iframe').contentDocument && document.querySelector('iframe').contentDocument.querySelector('.post-desc-box .input-editor'))`
-        );
-        if (r && r.result === true) { editorVisible = true; break; }
+        await sleep(5000);
+        try {
+          const r = await runInPage(
+            `!!(document.querySelector('iframe') && document.querySelector('iframe').contentDocument && document.querySelector('iframe').contentDocument.querySelector('.post-desc-box .input-editor'))`
+          );
+          if (r && r.result === true) { editorVisible = true; break; }
+        } catch (e) {
+          console.log('[Auto Upload] 视频号：等待编辑器出现...', e?.message || '');
+        }
       }
       if (!editorVisible) throw new Error('等待上传完成超时');
 
@@ -821,6 +927,25 @@
       if (meta?.cover_path) {
         await postJSON('/progress', { task_id, progress: 80, msg: '视频号：准备上传封面' });
 
+        // 滚动 iframe 内容到封面区域，确保编辑按钮可见
+        await runInPage(`
+          (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                var doc = iframes[i].contentDocument;
+                // 先滚动到底部，封面区域通常在下方
+                var editBtn = doc.querySelector('.edit-btn');
+                if (editBtn) { editBtn.scrollIntoView({ block: 'center' }); return; }
+                // 兜底：滚动到表单底部
+                var form = doc.querySelector('.post-desc-box') || doc.querySelector('.form-btns');
+                if (form) form.scrollIntoView({ block: 'end' });
+              } catch(e) {}
+            }
+          })()
+        `);
+        await sleep(1000);
+
         // 等待封面预览图完全加载（.edit-btn 可见，最多 90s）
         let editBtnReady = false;
         for (let i = 0; i < 45; i++) {
@@ -831,7 +956,10 @@
                 try {
                   var doc = iframes[i].contentDocument;
                   var editBtn = doc.querySelector('.edit-btn');
-                  if (editBtn && editBtn.offsetParent) return true;
+                  if (editBtn) {
+                    editBtn.scrollIntoView({ block: 'center' });
+                    if (editBtn.offsetParent) return true;
+                  }
                 } catch(e) {}
               }
               return false;
@@ -1150,7 +1278,32 @@
         await postJSON('/progress', { task_id, progress: 88, msg: '视频号：定时发布已设置 ' + meta.publish_time });
       }
 
-      // Step 6: 点击发表
+      // Step 6: 等待视频上传完成（发表按钮不再 disabled），最多等 10 分钟
+      await postJSON('/progress', { task_id, progress: 88, msg: '视频号：等待视频上传完成...' });
+      const publishWaitStart = Date.now();
+      const publishWaitTimeout = 10 * 60 * 1000;
+      while (Date.now() - publishWaitStart < publishWaitTimeout) {
+        const btnState = await runInPage(`
+          (function() {
+            try {
+              var doc = document.querySelector('iframe').contentDocument;
+              var btn = doc.querySelector('.form-btns button.weui-desktop-btn_primary');
+              if (!btn) return { found: false };
+              return { found: true, disabled: btn.disabled || btn.classList.contains('weui-desktop-btn_disabled') || btn.classList.contains('is-disabled'), text: btn.textContent.trim() };
+            } catch(e) { return { found: false }; }
+          })()
+        `);
+        if (btnState?.result?.found && !btnState.result.disabled) {
+          console.log('[Auto Upload] 视频号发表按钮可用:', btnState.result.text);
+          break;
+        }
+        if (btnState?.result?.found) {
+          await postJSON('/progress', { task_id, progress: 89, msg: '视频号：视频上传中，等待完成...' });
+        }
+        await sleep(3000);
+      }
+
+      // 点击发表
       await sleep(500);
       const publishResult = await runInPage(`
         (function() {
@@ -1398,7 +1551,7 @@
 
       let scheduleSwitch = null;
       for (let i = 0; i < 10; i++) {
-        scheduleSwitch = document.querySelector('.post-time-wrapper .d-switch-simulator');
+        scheduleSwitch = document.querySelector('.custom-switch-card .d-switch-simulator');
         if (scheduleSwitch) break;
         await sleep(500);
       }
@@ -1475,16 +1628,31 @@
     document.body.click();
     await sleep(500);
 
-    // 点击发布/保存按钮（用 CDP 点击确保生效）
-    const publishBtn = document.querySelector('.publish-page-publish-btn button');
-    if (publishBtn) {
-      publishBtn.scrollIntoView({ block: 'center' });
-      await sleep(500);
-      await chrome.runtime.sendMessage({ type: 'cdpClick', selector: '.publish-page-publish-btn button' });
-      console.log('[Auto Upload] 编辑：已点击发布按钮');
-      await sleep(2000);
-    } else {
-      console.warn('[Auto Upload] 编辑：未找到发布按钮');
+    // 点击发布/保存按钮
+    const isScheduled = !!(editMeta.publish_time && editMeta.publish_time !== '');
+    const editTargetText = isScheduled ? '定时发布' : '发布';
+    let editPublished = false;
+
+    const editBtnSpans = document.querySelectorAll('.d-button-content span');
+    for (const span of editBtnSpans) {
+      const text = (span.textContent || '').trim();
+      if (text === editTargetText) {
+        const btn = span.closest('button');
+        if (btn) {
+          btn.scrollIntoView({ block: 'center' });
+          await sleep(500);
+          btn.removeAttribute('disabled');
+          btn.click();
+          editPublished = true;
+          console.log(`[Auto Upload] 编辑：已点击「${editTargetText}」按钮`);
+          await sleep(2000);
+          break;
+        }
+      }
+    }
+
+    if (!editPublished) {
+      console.warn(`[Auto Upload] 编辑：未找到「${editTargetText}」按钮`);
     }
 
     return { status: 'ok' };
@@ -2781,6 +2949,89 @@
         // 本地服务未启动或网络错误，静默忽略
       }
 
+      // 检查是否有退出登录请求
+      try {
+        const logoutResp = await fetch(`${BASE_URL}/logout_request`);
+        if (logoutResp.ok) {
+          const logoutReq = await logoutResp.json();
+          if (logoutReq && logoutReq.account_id) {
+            const myPlatform = getPlatform();
+            if (!logoutReq.platform || logoutReq.platform === myPlatform) {
+              console.log(`[Auto Upload] 收到退出登录请求, 平台: ${logoutReq.platform}`);
+              try {
+                if (logoutReq.platform === 'xiaohongshu') {
+                  // 小红书：点击头像 → 展开菜单 → 点击"退出登录"
+                  const userInfo = document.querySelector('.user-info');
+                  if (userInfo) {
+                    userInfo.click();
+                    await sleep(800);
+                    const menuItems = document.querySelectorAll('.menu-list .popover_text span');
+                    let logoutBtn = null;
+                    for (const span of menuItems) {
+                      if ((span.textContent || '').includes('退出登录')) {
+                        logoutBtn = span.closest('.popover_text');
+                        break;
+                      }
+                    }
+                    if (logoutBtn) {
+                      logoutBtn.click();
+                      await sleep(1000);
+                      // 处理确认弹窗：点击"确定"按钮
+                      const confirmBtn = document.querySelector('.logout-modal .model-footer-confirm-btn');
+                      if (confirmBtn) {
+                        confirmBtn.click();
+                        await sleep(1500);
+                        console.log('[Auto Upload] 小红书退出登录 - 已点击确认');
+                      }
+                      await postJSON('/logout_status', {
+                        account_id: logoutReq.account_id,
+                        status: 'ok',
+                      });
+                      console.log('[Auto Upload] 小红书退出登录成功');
+                      chrome.runtime.sendMessage({ type: 'closeTab' });
+                    } else {
+                      await postJSON('/logout_status', {
+                        account_id: logoutReq.account_id,
+                        status: 'error',
+                        error: '未找到退出登录按钮',
+                      });
+                    }
+                  } else {
+                    await postJSON('/logout_status', {
+                      account_id: logoutReq.account_id,
+                      status: 'error',
+                      error: '未找到用户信息区域（可能未登录）',
+                    });
+                  }
+                } else {
+                  // 其他平台：用 cookie 清除方式兜底
+                  const result = await chrome.runtime.sendMessage({
+                    type: 'clearCookies',
+                    domain: logoutReq.domain,
+                  });
+                  await postJSON('/logout_status', {
+                    account_id: logoutReq.account_id,
+                    status: result?.ok ? 'ok' : 'error',
+                    removed: result?.removed || 0,
+                    error: result?.error || '',
+                  });
+                }
+              } catch (e) {
+                await postJSON('/logout_status', {
+                  account_id: logoutReq.account_id,
+                  status: 'error',
+                  error: e.message,
+                });
+              }
+              console.log('[Auto Upload] 退出登录流程结束');
+              chrome.runtime.sendMessage({ type: 'closeTab' });
+            }
+          }
+        }
+      } catch (e) {
+        // 静默忽略
+      }
+
       try {
         const resp = await fetch(`${BASE_URL}/task`);
         if (!resp.ok) continue;
@@ -2811,10 +3062,13 @@
   // 检测跨页面登录：扫码后页面跳转，新页面的 content.js 在此上报 confirmed
   (async () => {
     const pendingId = localStorage.getItem(LOGIN_PENDING_KEY);
+    console.log('[Auto Upload] 启动检测 pendingId:', pendingId, 'isOnLoginPage:', isOnLoginPage(), 'url:', location.href);
     if (pendingId && !isOnLoginPage()) {
       localStorage.removeItem(LOGIN_PENDING_KEY);
       await postJSON('/login_status', { account_id: pendingId, status: 'confirmed' });
       console.log('[Auto Upload] 跨页面登录已确认:', pendingId);
+      await sleep(500);
+      chrome.runtime.sendMessage({ type: 'closeTab' });
     }
   })();
 

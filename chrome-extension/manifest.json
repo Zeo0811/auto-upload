@@ -1,13 +1,19 @@
 {
   "manifest_version": 3,
   "name": "Auto Upload",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "description": "自动上传视频到多平台创作中心（小红书、抖音、视频号等）",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "scripting",
     "activeTab",
     "debugger",
-    "webNavigation"
+    "webNavigation",
+    "cookies"
   ],
   "host_permissions": [
     "https://creator.xiaohongshu.com/*",

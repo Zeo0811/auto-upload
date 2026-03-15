@@ -10,7 +10,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.session import load_session, save_session
+from core.session import load_session, save_session, delete_session
 from core.task_runner import create_task, update_task, get_task, run_task_in_background
 from config import TMP_DIR, PLATFORM_MANAGE_URLS
 
@@ -68,31 +68,146 @@ def login(platform: str, account_id: str) -> dict:
 
 
 # ====================================================================== #
+# 1.5 退出登录
+# ====================================================================== #
+
+PLATFORM_COOKIE_DOMAINS = {
+    "xiaohongshu": "xiaohongshu.com",
+    "channels": "qq.com",
+    "douyin": "douyin.com",
+}
+
+def logout(platform: str, account_id: str) -> dict:
+    """
+    退出登录：清除浏览器 cookie + 删除本地 session。
+
+    返回:
+      {"status": "ok", "message": "已退出登录", "cookies_removed": N}
+      {"status": "ok", "message": "未找到登录状态，无需退出"}
+      {"status": "error", "error": "..."}
+    """
+    import subprocess
+    from core.local_server import start_server, set_logout_request, get_logout_state
+
+    # 删除本地 session
+    session = load_session(platform, account_id)
+    delete_session(platform, account_id)
+
+    # 通过插件清除浏览器 cookie
+    domain = PLATFORM_COOKIE_DOMAINS.get(platform, "")
+    if not domain:
+        return {"status": "ok", "message": f"{platform}/{account_id} 已退出登录（仅清除本地 session）"}
+
+    start_server()
+
+    # 先打开平台页面，等 content.js 加载
+    from config import PLATFORM_URLS
+    url = PLATFORM_URLS.get(platform, "")
+    if url:
+        subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
+    time.sleep(5)  # 等标签页加载 + content.js 注入
+
+    set_logout_request(account_id, platform, domain)
+
+    # 等待插件清除 cookie 完成（最多 30 秒）
+    deadline = time.time() + 30
+    last_set_time = time.time()
+    while time.time() < deadline:
+        time.sleep(1)
+        # 每 5 秒重新设置一次请求，防止被空消费
+        if time.time() - last_set_time > 5:
+            state = get_logout_state(account_id)
+            if not state:
+                set_logout_request(account_id, platform, domain)
+                last_set_time = time.time()
+        state = get_logout_state(account_id)
+        if not state:
+            continue
+        if state.get("status") == "ok":
+            return {
+                "status": "ok",
+                "message": f"{platform}/{account_id} 已退出登录",
+                "cookies_removed": state.get("removed", 0),
+            }
+        if state.get("status") == "error":
+            return {"status": "error", "error": f"清除 cookie 失败: {state.get('error', '')}"}
+
+    # 超时但本地 session 已删
+    return {"status": "ok", "message": f"{platform}/{account_id} 已清除本地 session，浏览器 cookie 清除超时（插件可能未运行）"}
+
+
+# ====================================================================== #
 # 2. 轮询扫码结果
 # ====================================================================== #
+
+_qr_refresh_count: dict = {}  # account_id → 已刷新次数
+MAX_QR_REFRESH = 3
 
 def check_login(platform: str, account_id: str) -> dict:
     """
     轮询扫码登录状态。在调用 login() 返回 qr_required 后循环调用此函数。
 
     返回:
-      {"status": "pending"}   等待用户扫码
-      {"status": "confirmed"} 登录成功
+      {"status": "pending"}    等待用户扫码
+      {"status": "confirmed"}  登录成功
+      {"status": "qr_refreshed", "qr_path": "..."}  二维码已自动刷新，需重新展示给用户
       {"status": "error", "error": "..."}
     """
-    from core.local_server import get_login_state
+    import subprocess
+    from core.local_server import get_login_state, clear_login_state, set_login_request
+
     state = get_login_state(account_id)
     if not state:
         return {'status': 'pending'}
     status = state.get('status')
     if status == 'confirmed':
         save_session(platform, account_id, {'logged_in': True})
+        _qr_refresh_count.pop(account_id, None)
         return {'status': 'confirmed'}
     if status == 'ok':
         save_session(platform, account_id, {'logged_in': True})
+        _qr_refresh_count.pop(account_id, None)
         return {'status': 'confirmed'}
     if status == 'error':
-        return {'status': 'error', 'error': state.get('error', '')}
+        error_msg = state.get('error', '')
+        # 二维码超时：自动刷新页面重新获取
+        if error_msg == 'qr_timeout':
+            count = _qr_refresh_count.get(account_id, 0)
+            if count < MAX_QR_REFRESH:
+                _qr_refresh_count[account_id] = count + 1
+                clear_login_state(account_id)
+                set_login_request(account_id, platform)
+                # 刷新浏览器标签页
+                from config import PLATFORM_URLS
+                url = PLATFORM_URLS.get(platform, "")
+                if url:
+                    subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
+                # 等待插件重新获取二维码
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    time.sleep(1)
+                    new_state = get_login_state(account_id)
+                    if not new_state:
+                        continue
+                    new_status = new_state.get('status')
+                    if new_status == 'qr_required':
+                        qr_path = new_state.get('qr_path', '')
+                        if qr_path:
+                            os.system(f"open '{qr_path}'")
+                        return {
+                            'status': 'qr_refreshed',
+                            'qr_path': qr_path,
+                        }
+                    if new_status == 'ok':
+                        save_session(platform, account_id, {'logged_in': True})
+                        _qr_refresh_count.pop(account_id, None)
+                        return {'status': 'confirmed'}
+                # 刷新失败
+                return {'status': 'error', 'error': f'二维码刷新失败（第 {count + 1} 次）'}
+            else:
+                _qr_refresh_count.pop(account_id, None)
+                return {'status': 'error', 'error': f'二维码超时，已重试 {MAX_QR_REFRESH} 次'}
+        return {'status': 'error', 'error': error_msg}
     return {'status': 'pending'}
 
 
