@@ -435,9 +435,9 @@
       await postJSON('/progress', { task_id, progress: 75, msg: '标题已填写' });
 
       // 8. 填写描述 + 话题
-      // 优先 Quill 编辑器，再退而求其次用带 placeholder 的 contenteditable（比裸 [contenteditable] 更精确）
+      // 优先 TipTap/ProseMirror 编辑器（小红书当前使用），兼容旧版 Quill 编辑器
       const descEl = document.querySelector(
-        '.ql-editor, [contenteditable="true"][data-placeholder], textarea[placeholder*="描述"], textarea[placeholder*="内容"]'
+        '.tiptap.ProseMirror[contenteditable="true"], .ql-editor, [contenteditable="true"][data-placeholder], textarea[placeholder*="描述"], textarea[placeholder*="内容"]'
       );
       if (descEl && meta) {
         descEl.focus();
@@ -467,14 +467,15 @@
             let topicPopup = null;
             for (let i = 0; i < 8; i++) {
               await sleep(250);
-              topicPopup = document.querySelector('#creator-editor-topic-container');
+              topicPopup = document.querySelector('#creator-editor-topic-container, [class*="topic-container"], [class*="topic-list"]');
               if (topicPopup) break;
             }
 
             if (topicPopup) {
               // 点击第一个建议项选中话题，再按 Enter 确认
               const firstItem = topicPopup.querySelector('.item.is-selected') ||
-                                topicPopup.querySelector('.item');
+                                topicPopup.querySelector('.item') ||
+                                topicPopup.querySelector('[class*="item"]');
               if (firstItem) {
                 firstItem.click();
                 await sleep(400);
@@ -494,10 +495,21 @@
       await postJSON('/progress', { task_id, progress: 80, msg: '描述已填写' });
 
       // 确保所有话题弹窗关闭后再继续
-      await sleep(1000);
-      // 点击编辑器外部收起任何残留弹窗
-      document.querySelector('.publish-page-content')?.click();
       await sleep(500);
+      // 按 Escape 关闭残留的话题选择弹窗
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+      await sleep(300);
+      // 点击编辑器外部收起任何残留弹窗
+      const outsideEl = document.querySelector('.publish-page-content') || document.querySelector('.content-container') || document.body;
+      outsideEl.click();
+      await sleep(500);
+      // 再次检查弹窗是否还在，强制移除
+      const leftoverPopup = document.querySelector('#creator-editor-topic-container, [class*="topic-container"], [class*="topic-list"]');
+      if (leftoverPopup) {
+        descEl?.blur();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+        await sleep(300);
+      }
 
       // 8.5 上传封面图
       if (meta && meta.cover_path) {
