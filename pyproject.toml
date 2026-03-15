@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-upload"
-version = "1.6.0"
+version = "1.8.0"
 description = "Automated video upload to social platforms (Xiaohongshu, WeChat Channels, Douyin) via Chrome Extension + Python API + MCP Server"
 readme = "README.md"
 license = {text = "MIT"}

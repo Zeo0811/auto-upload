@@ -12,6 +12,8 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   url: [
     { hostContains: 'channels.weixin.qq.com' },
     { hostContains: 'creator.xiaohongshu.com' },
+    { hostContains: 'creator.douyin.com' },
+    { hostContains: 'sso.douyin.com' },
   ]
 });
 

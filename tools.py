@@ -492,7 +492,7 @@ def delete_batch(platform: str, account_id: str, post_ids: list) -> dict:
     返回:
       {"status": "ok", "deleted": N, "failed": M, "not_found": K}
     """
-    if platform == "xiaohongshu":
+    if platform in ("xiaohongshu", "douyin"):
         return _submit_manage_task(platform, account_id, "delete_batch", {
             "post_ids": post_ids,
         }, timeout=600)

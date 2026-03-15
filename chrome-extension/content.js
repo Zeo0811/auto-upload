@@ -96,6 +96,18 @@
                 Array.from(document.querySelectorAll('span,div')).some(el => el.childElementCount === 0 && (el.textContent || '').includes('微信扫码登录')));
       return hasQr;
     }
+    if (platform === 'douyin') {
+      // 抖音 SSO 登录页
+      if (location.hostname.includes('sso.douyin.com')) return true;
+      if (location.pathname.includes('/login')) return true;
+      // 检测抖音登录面板（不检查 offsetParent，因为面板可能是 fixed 定位）
+      const loginPanel = document.querySelector('#douyin_login_comp_flat_panel');
+      if (loginPanel) return true;
+      // 检测扫码二维码
+      const qrImg = document.querySelector('#animate_qrcode_container img');
+      if (qrImg) return true;
+      return false;
+    }
     return location.pathname.includes('/login');
   }
 
@@ -106,6 +118,7 @@
     }
     const platform = getPlatform();
     if (platform === 'channels') return checkAndHandleChannelsLogin(accountId);
+    if (platform === 'douyin')   return checkAndHandleDouyinLogin(accountId);
     return checkAndHandleXhsLogin(accountId);
   }
 
@@ -252,6 +265,97 @@
     return false;
   }
 
+  // 抖音登录
+  async function checkAndHandleDouyinLogin(accountId) {
+    // 等待登录面板加载
+    for (let i = 0; i < 30; i++) {
+      const panel = document.querySelector('#douyin_login_comp_flat_panel');
+      const qrArea = document.querySelector('[class*="scan_qrcode_login"]');
+      if (panel || qrArea) break;
+      await sleep(1000);
+    }
+    await sleep(2000);
+
+    // 获取 QR 码
+    let qrBase64 = '';
+    const QR_MIN_LENGTH = 1000;
+
+    // QR 容器：#animate_qrcode_container > div.qrcode-xxx > img
+    for (let attempt = 0; attempt < 5; attempt++) {
+      // 精确选择器：#animate_qrcode_container 内的 img
+      let qrImg = document.querySelector('#animate_qrcode_container img') ||
+                  document.querySelector('[class*="scan_qrcode_login"] img') ||
+                  document.querySelector('#douyin_login_comp_flat_panel img');
+
+      // fallback: 找 class 包含 qrcode 的 div 内的 img
+      if (!qrImg) {
+        qrImg = document.querySelector('[class*="qrcode"] img');
+      }
+
+      if (qrImg && qrImg.src && qrImg.src.length > QR_MIN_LENGTH) {
+        qrBase64 = qrImg.src;
+        console.log(`[Auto Upload] 抖音 QR 获取成功 (第 ${attempt + 1} 次, 长度: ${qrBase64.length})`);
+        break;
+      }
+
+      // fallback: 截图方式
+      if (attempt >= 2) {
+        const qrArea = document.querySelector('#animate_qrcode_container') ||
+                        document.querySelector('[class*="scan_qrcode_login"]') ||
+                        document.querySelector('#douyin_login_comp_flat_panel');
+        if (qrArea) {
+          qrArea.scrollIntoView({ block: 'center', behavior: 'instant' });
+          await sleep(300);
+          const r = qrArea.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            const clip = { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height };
+            const shot = await chrome.runtime.sendMessage({ type: 'captureScreenshot', clip });
+            if (shot?.ok && shot.dataUrl) { qrBase64 = shot.dataUrl; break; }
+          }
+        }
+      }
+
+      console.log(`[Auto Upload] 抖音 QR 第 ${attempt + 1} 次未取到有效二维码`);
+      await sleep(2000);
+    }
+
+    console.log(`[Auto Upload] 抖音 QR 获取${qrBase64 ? '成功' : '失败'}，长度: ${qrBase64.length}`);
+
+    await postJSON('/login_status', {
+      account_id: accountId,
+      status: 'qr_required',
+      qr_base64: qrBase64,
+    });
+
+    localStorage.setItem(LOGIN_PENDING_KEY, accountId);
+    const QR_TIMEOUT = 120 * 1000;  // 抖音扫码给 120 秒
+    const deadline = Date.now() + QR_TIMEOUT;
+    while (Date.now() < deadline) {
+      await sleep(2000);
+      // 登录成功：跳转到创作者中心
+      if (!isOnLoginPage()) {
+        localStorage.removeItem(LOGIN_PENDING_KEY);
+        await postJSON('/login_status', { account_id: accountId, status: 'confirmed' });
+        await sleep(500);
+        chrome.runtime.sendMessage({ type: 'closeTab' });
+        return true;
+      }
+      // 检测二维码过期
+      const expiredText = Array.from(document.querySelectorAll('div,span,p')).some(
+        el => el.childElementCount === 0 && /已过期|已失效|刷新/.test(el.textContent || '')
+      );
+      if (expiredText) {
+        console.log('[Auto Upload] 抖音二维码已过期');
+        break;
+      }
+    }
+
+    localStorage.removeItem(LOGIN_PENDING_KEY);
+    await postJSON('/login_status', { account_id: accountId, status: 'error', error: 'qr_timeout' });
+    chrome.runtime.sendMessage({ type: 'closeTab' });
+    return false;
+  }
+
   // -------------------------------------------------------------------------
   // 平台检测
   // -------------------------------------------------------------------------
@@ -281,6 +385,7 @@
     // 上传操作
     if (platform === 'xiaohongshu') return runXhsTask(task);
     if (platform === 'channels')    return runChannelsTask(task);
+    if (platform === 'douyin')      return runDouyinTask(task);
     throw new Error('当前页面不是支持的平台: ' + location.hostname);
   }
 
@@ -321,6 +426,13 @@
           await channelsEditContinue(task_id, meta);
           result = { status: 'ok' };
         }
+        else throw new Error(`不支持的管理操作: ${manageType}`);
+      } else if (platform === 'douyin') {
+        if (manageType === 'list_posts')  result = await douyinListPosts(task_id, meta);
+        else if (manageType === 'edit_post')   result = await douyinEditPost(task_id, meta);
+        else if (manageType === 'delete_post') result = await douyinDeletePost(task_id, meta);
+        else if (manageType === 'delete_all_posts') result = await douyinDeleteAllPosts(task_id, meta);
+        else if (manageType === 'delete_batch') result = await douyinDeleteBatch(task_id, meta);
         else throw new Error(`不支持的管理操作: ${manageType}`);
       } else {
         throw new Error(`平台 ${platform} 不支持管理操作`);
@@ -1339,6 +1451,416 @@
       console.error('[Auto Upload] 视频号任务失败', task_id, e);
       navigator.sendBeacon(BASE_URL + '/fail', JSON.stringify({ task_id, error: e.message || String(e) }));
       chrome.runtime.sendMessage({ type: 'closeTab' });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 抖音上传流程
+  // -------------------------------------------------------------------------
+
+  async function runDouyinTask(task) {
+    const { task_id, meta } = task;
+    console.log('[Auto Upload] 抖音任务开始', task_id);
+
+    try {
+      // 0. 检查登录
+      if (isOnLoginPage()) {
+        await checkAndHandleLogin('default');
+        await sleep(3000);
+      }
+
+      // 1. 等待页面稳定
+      await sleep(3000);
+      await dismissPopupsRounds(5, 800);
+      await postJSON('/progress', { task_id, progress: 10, msg: '抖音：弹窗已清理' });
+
+      // 2. 注入视频文件
+      await postJSON('/progress', { task_id, progress: 15, msg: '抖音：准备注入文件' });
+      let setResult = null;
+      for (let fileAttempt = 0; fileAttempt < 15; fileAttempt++) {
+        setResult = await chrome.runtime.sendMessage({
+          type: 'setFileInput',
+          filePath: task.file_path,
+          selector: 'input[type="file"]',
+        });
+        if (setResult && setResult.ok) break;
+        console.log(`[Auto Upload] 抖音 file input 未找到 (第${fileAttempt + 1}次)，等待...`);
+        await sleep(2000);
+      }
+      if (!setResult || !setResult.ok) {
+        throw new Error('视频注入失败: ' + (setResult?.error || '未知'));
+      }
+      await postJSON('/progress', { task_id, progress: 25, msg: '抖音：文件已注入，等待上传完成' });
+
+      // 3. 等待上传完成（标题输入框出现或编辑器可用）
+      const uploadTimeout = 10 * 60 * 1000;
+      const uploadStart = Date.now();
+      let editorReady = false;
+
+      while (Date.now() - uploadStart < uploadTimeout) {
+        await sleep(3000);
+
+        // 每 9 秒处理一次弹窗
+        const elapsed = Date.now() - uploadStart;
+        if (elapsed % 9000 < 3500) dismissPopups();
+
+        // 检测上传进度文字
+        const progressEl = document.querySelector('[class*="progress"], [class*="upload-progress"], [class*="percent"]');
+        if (progressEl) {
+          const pText = (progressEl.innerText || '').trim();
+          if (pText) await postJSON('/progress', { task_id, progress: 30, msg: `抖音：上传中 ${pText}` });
+        }
+
+        // 检测上传失败
+        const bodyText = document.body.innerText || '';
+        if (bodyText.includes('上传失败')) throw new Error('检测到"上传失败"提示');
+
+        // 检测标题输入框/编辑器出现（上传完成的信号）
+        const titleInput = document.querySelector(
+          'input[placeholder*="标题"], input[placeholder*="作品标题"], [class*="title-input"] input, [class*="titleInput"] input'
+        );
+        const descEditor = document.querySelector(
+          '[contenteditable="true"][class*="editor"], [contenteditable="true"][class*="desc"], .ql-editor, [class*="notranslate"][contenteditable="true"]'
+        );
+        if ((titleInput && titleInput.offsetParent) || (descEditor && descEditor.offsetParent)) {
+          editorReady = true;
+          await postJSON('/progress', { task_id, progress: 70, msg: '抖音：上传完成，填写信息' });
+          break;
+        }
+      }
+
+      if (!editorReady) throw new Error('等待上传完成超时（10分钟）');
+
+      await sleep(2000);
+      await dismissPopupsRounds(3, 600);
+
+      // 4. 填写标题
+      if (meta && meta.title) {
+        const titleEl = document.querySelector(
+          'input[placeholder*="标题"], input[placeholder*="作品标题"], [class*="title-input"] input, [class*="titleInput"] input'
+        );
+        if (titleEl) {
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          nativeSetter.call(titleEl, meta.title);
+          titleEl.dispatchEvent(new Event('input', { bubbles: true }));
+          titleEl.dispatchEvent(new Event('change', { bubbles: true }));
+          console.log('[Auto Upload] 抖音：标题已填写');
+        }
+      }
+      await postJSON('/progress', { task_id, progress: 75, msg: '抖音：标题已填写' });
+
+      // 5. 填写描述 + 话题
+      const descEl = document.querySelector(
+        '.editor-kit-container[contenteditable="true"], [contenteditable="true"][class*="editor"], [contenteditable="true"][class*="desc"], .ql-editor, [class*="notranslate"][contenteditable="true"]'
+      );
+      console.log('[Auto Upload] 抖音描述编辑器:', descEl ? descEl.className : '未找到', 'description:', meta?.description, 'tags:', meta?.tags);
+      if (descEl && meta) {
+        descEl.focus();
+        await sleep(300);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+
+        if (meta.description) {
+          document.execCommand('insertText', false, meta.description);
+          descEl.dispatchEvent(new Event('input', { bubbles: true }));
+          await sleep(300);
+        }
+
+        // 插入话题标签
+        if (meta.tags && meta.tags.length > 0) {
+          if (meta.description) {
+            document.execCommand('insertText', false, ' ');
+            await sleep(200);
+          }
+          for (const tag of meta.tags) {
+            document.execCommand('insertText', false, `#${tag}`);
+            descEl.dispatchEvent(new Event('input', { bubbles: true }));
+
+            // 等话题建议弹窗出现
+            let topicPopup = null;
+            for (let i = 0; i < 8; i++) {
+              await sleep(300);
+              topicPopup = document.querySelector(
+                '[class*="topic-container"], [class*="topic-list"], [class*="mention-list"], [class*="hashtag"]'
+              );
+              if (topicPopup) break;
+            }
+
+            if (topicPopup) {
+              const firstItem = topicPopup.querySelector('[class*="item"], [class*="option"], li');
+              if (firstItem) {
+                firstItem.click();
+                await sleep(400);
+              }
+              descEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+              descEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', keyCode: 13, bubbles: true }));
+              await sleep(300);
+            } else {
+              document.execCommand('insertText', false, ' ');
+              await sleep(200);
+            }
+          }
+        }
+      }
+      await postJSON('/progress', { task_id, progress: 80, msg: '抖音：描述已填写' });
+
+      // 关闭残留话题弹窗
+      await sleep(500);
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+      await sleep(300);
+
+      // 6. 上传封面（如果提供）
+      if (meta && meta.cover_path) {
+        await postJSON('/progress', { task_id, progress: 82, msg: '抖音：准备上传封面' });
+
+        // Step 1: 用 CDP 真实点击封面区域（JS .click() 无法触发模态框）
+        let coverArea = document.querySelector('[class*="coverControl"]') ||
+                         document.querySelector('[class*="cover-Jg"]');
+        if (!coverArea) {
+          coverArea = Array.from(document.querySelectorAll('div')).find(
+            el => el.childElementCount <= 3 && (el.textContent || '').includes('选择封面')
+          );
+        }
+        if (coverArea) {
+          coverArea.scrollIntoView({ block: 'center' });
+          await sleep(500);
+
+          // 给封面区域打标记，用 CDP 真实鼠标事件点击
+          coverArea.setAttribute('data-auto-upload-target', 'cover-area');
+          const clickResult = await chrome.runtime.sendMessage({
+            type: 'cdpClick', selector: '[data-auto-upload-target="cover-area"]',
+          });
+          console.log('[Auto Upload] 抖音：封面区域 CDP 点击', clickResult?.ok ? '成功' : ('失败: ' + clickResult?.error));
+          await sleep(2000);
+
+          let coverUploaded = false;
+
+          // Step 2: 等待封面编辑模态框出现（通过 semi-upload-drag-area 判断）
+          let modal = null;
+          for (let i = 0; i < 15; i++) {
+            // 直接找全局的 semi-upload-drag-area，它出现就说明模态框已打开
+            if (document.querySelector('.semi-upload-drag-area')) {
+              modal = document.body; // 用 body 作为搜索范围
+              break;
+            }
+            await sleep(500);
+          }
+
+          if (modal) {
+
+            // 先点击"上传封面"标签激活上传面板
+            const uploadTab = Array.from(document.querySelectorAll('div,span')).find(
+              el => el.offsetParent && el.childElementCount === 0 && (el.textContent || '').trim() === '上传封面'
+            );
+            if (uploadTab) {
+              uploadTab.click();
+              await sleep(1000);
+            }
+
+            let uploadArea = document.querySelector('.semi-upload-drag-area');
+
+            if (uploadArea) {
+              // CDP 点击 semi-upload-drag-area 触发文件选择
+              const uploadClickResult = await chrome.runtime.sendMessage({
+                type: 'setFileViaChooser',
+                filePath: meta.cover_path,
+                clickSelector: '.semi-upload-drag-area',
+              });
+
+              if (uploadClickResult?.ok) {
+                console.log('[Auto Upload] 抖音：封面文件已通过 FileChooser 注入');
+                await sleep(3000);
+                coverUploaded = true;
+              } else {
+                console.warn('[Auto Upload] 抖音：FileChooser 注入失败，尝试 setFileInput', uploadClickResult?.error);
+                // Fallback: 直接注入 image file input
+                const coverResult = await chrome.runtime.sendMessage({
+                  type: 'setFileInput',
+                  filePath: meta.cover_path,
+                  selector: 'input[type="file"][accept*="image"]',
+                });
+                if (coverResult?.ok) {
+                  console.log('[Auto Upload] 抖音：封面文件已通过 setFileInput 注入');
+                  await sleep(3000);
+                  coverUploaded = true;
+                } else {
+                  console.warn('[Auto Upload] 抖音封面文件注入失败:', coverResult?.error);
+                }
+              }
+
+              // Step 4: 点击"完成"按钮（全局搜索，因为模态框不在 modal 变量内）
+              if (coverUploaded) {
+                await sleep(2000);
+                const finishBtn = document.querySelector('button.semi-button-primary.secondary-zU1YLr')
+                  || Array.from(document.querySelectorAll('button.semi-button-primary')).find(btn =>
+                    btn.offsetParent && (btn.innerText || '').trim() === '完成'
+                  )
+                  || Array.from(document.querySelectorAll('button')).find(btn =>
+                    btn.offsetParent && (btn.innerText || '').trim() === '完成'
+                  );
+                if (finishBtn) {
+                  finishBtn.click();
+                  await sleep(2000);
+                  console.log('[Auto Upload] 抖音：封面完成按钮已点击');
+                } else {
+                  console.warn('[Auto Upload] 抖音：未找到完成按钮');
+                }
+              }
+            } else {
+              await postJSON('/progress', { task_id, progress: 83, msg: '抖音封面：模态框内未找到 semi-upload-drag-area' });
+            }
+          } else {
+            await postJSON('/progress', { task_id, progress: 83, msg: '抖音封面：模态框未打开' });
+          }
+
+          await postJSON('/progress', { task_id, progress: 84, msg: coverUploaded ? '抖音：封面已上传' : '抖音：封面上传失败，已跳过' });
+        } else {
+          console.warn('[Auto Upload] 抖音：未找到封面区域');
+        }
+      }
+
+      // 7. 定时发布
+      if (meta && meta.publish_time) {
+        await postJSON('/progress', { task_id, progress: 85, msg: '抖音：设置定时发布' });
+
+        // 点击"定时发布"选项
+        const scheduleRadio = Array.from(document.querySelectorAll('label, [class*="radio"], [role="radio"]')).find(
+          el => (el.textContent || '').includes('定时发布')
+        );
+        if (scheduleRadio) {
+          scheduleRadio.click();
+          await sleep(1000);
+        }
+
+        // 填写时间
+        const dtInput = document.querySelector(
+          '[class*="date"] input, [class*="time"] input, input[placeholder*="选择"], input[placeholder*="时间"]'
+        );
+        if (dtInput) {
+          const [datePart, timePart] = meta.publish_time.split(' ');
+          const fullDateTime = `${datePart.replace(/\b(\d)\b/g, '0$1')} ${timePart.replace(/\b(\d)\b/g, '0$1')}`;
+          dtInput.focus();
+          await sleep(300);
+          const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          nativeSetter.call(dtInput, fullDateTime);
+          dtInput.dispatchEvent(new Event('input', { bubbles: true }));
+          dtInput.dispatchEvent(new Event('change', { bubbles: true }));
+          dtInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+          await sleep(500);
+          dtInput.blur();
+          await sleep(500);
+        }
+
+        await postJSON('/progress', { task_id, progress: 87, msg: `抖音：定时发布已设置 ${meta.publish_time}` });
+      }
+
+      // 8. 点击发布
+      const isScheduled = !!(meta && meta.publish_time);
+      const targetBtnText = isScheduled ? '定时发布' : '发布';
+      let published = false;
+
+      const allBtns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent);
+      for (const btn of allBtns) {
+        const text = (btn.innerText || btn.textContent || '').trim();
+        if (text === targetBtnText || (text === '发布' && !isScheduled)) {
+          btn.removeAttribute('disabled');
+          btn.click();
+          published = true;
+          console.log(`[Auto Upload] 抖音：点击「${text}」按钮`);
+          break;
+        }
+      }
+
+      if (!published) {
+        // fallback: 找包含"发布"文字的按钮（排除"高清发布"、"暂存离开"等）
+        const excludeTexts = ['高清发布', '暂存离开', '重新上传'];
+        for (const btn of allBtns) {
+          const text = (btn.innerText || btn.textContent || '').trim();
+          if (text.includes('发布') && !excludeTexts.some(ex => text.includes(ex))) {
+            btn.removeAttribute('disabled');
+            btn.click();
+            published = true;
+            console.log(`[Auto Upload] 抖音：fallback 点击「${text}」按钮`);
+            break;
+          }
+        }
+      }
+
+      if (!published) {
+        const btnTexts = allBtns.map(b => (b.innerText || '').trim()).filter(t => t);
+        throw new Error(`未找到「${targetBtnText}」按钮，页面按钮: [${btnTexts.join(', ')}]`);
+      }
+
+      await postJSON('/progress', { task_id, progress: 90, msg: '抖音：已点击发布按钮，等待确认' });
+
+      // 9. 等待发布完成确认
+      const publishStart = Date.now();
+      const publishTimeout = 60 * 1000;
+      let publishConfirmed = false;
+      const publishPageUrl = location.href;
+
+      while (Date.now() - publishStart < publishTimeout) {
+        await sleep(2000);
+
+        // 优先检测成功信号（避免误判）
+        // 检测页面跳转（发布成功后通常会跳转到内容管理页）
+        if (location.href !== publishPageUrl) {
+          publishConfirmed = true;
+          console.log('[Auto Upload] 抖音：页面已跳转，发布成功', location.href);
+          break;
+        }
+
+        // 检测成功提示文字
+        const toastEls = Array.from(document.querySelectorAll(
+          '[class*="toast"], [class*="semi-toast"], [class*="semi-notification"]'
+        )).filter(el => el.offsetParent);
+        for (const toast of toastEls) {
+          const t = (toast.innerText || '').trim();
+          if (t.includes('发布成功') || t.includes('作品已发布') || t.includes('定时发布成功')) {
+            publishConfirmed = true;
+            console.log('[Auto Upload] 抖音：检测到发布成功提示', t);
+            break;
+          }
+        }
+        if (publishConfirmed) break;
+
+        // 检测发布错误提示
+        for (const toast of toastEls) {
+          const t = (toast.innerText || '').trim();
+          if (t && (t.includes('失败') || t.includes('错误') || t.includes('异常'))) {
+            throw new Error(`发布失败：${t}`);
+          }
+        }
+
+        // 检测真正的验证弹窗（iframe 内嵌验证，非页面上的普通元素）
+        const verifyIframe = Array.from(document.querySelectorAll('iframe')).find(
+          f => f.src && (f.src.includes('verify') || f.src.includes('captcha'))
+        );
+        if (verifyIframe) {
+          throw new Error('发布被拦截：检测到验证弹窗(iframe)，需要手动完成验证');
+        }
+      }
+
+      if (!publishConfirmed) {
+        // 超时后再检查一次是否跳转了
+        if (location.href !== publishPageUrl) {
+          publishConfirmed = true;
+        } else {
+          throw new Error('发布超时：点击发布按钮后60秒内未确认成功，可能需要手动检查');
+        }
+      }
+
+      const postUrl = location.href;
+      navigator.sendBeacon(BASE_URL + '/done', JSON.stringify({ task_id, post_url: postUrl }));
+      console.log('[Auto Upload] 抖音任务完成', task_id);
+
+      // 发布成功后关闭标签页
+      await sleep(2000);
+      chrome.runtime.sendMessage({ type: 'closeTab' });
+
+    } catch (e) {
+      console.error('[Auto Upload] 抖音任务失败', task_id, e);
+      navigator.sendBeacon(BASE_URL + '/fail', JSON.stringify({ task_id, error: e.message || String(e) }));
     }
   }
 
@@ -2922,6 +3444,369 @@
     }
 
     return { status: 'ok', deleted, failed };
+  }
+
+  // -------------------------------------------------------------------------
+  // 抖音 — 内容管理
+  // -------------------------------------------------------------------------
+
+  // 等待抖音内容列表加载
+  async function douyinWaitForList() {
+    for (let i = 0; i < 30; i++) {
+      const container = document.querySelector('[class*="content-body"]');
+      if (container && container.childElementCount > 0) return;
+      await sleep(1000);
+    }
+  }
+
+  // 滚动加载抖音全部内容
+  async function douyinScrollLoadAll() {
+    await douyinWaitForList();
+    const scrollContainer = document.querySelector('[class*="content-body"]') || document.documentElement;
+    let prevCount = 0, stableRounds = 0;
+    for (let i = 0; i < 100; i++) {
+      const currentCount = scrollContainer.childElementCount;
+      if (currentCount === prevCount) {
+        stableRounds++;
+        if (stableRounds >= 3) break;
+      } else {
+        stableRounds = 0;
+        prevCount = currentCount;
+      }
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      window.scrollTo(0, document.body.scrollHeight);
+      await sleep(1000);
+    }
+    window.scrollTo(0, 0);
+    await sleep(500);
+  }
+
+  async function douyinListPosts(taskId, meta) {
+    await douyinScrollLoadAll();
+
+    const statusFilter = meta.status_filter || '';
+    const posts = [];
+
+    // 抖音内容管理页：卡片式布局，每个卡片是 content-body 的直接子 div
+    const container = document.querySelector('[class*="content-body"]');
+    const cards = container ? Array.from(container.children).filter(el => el.tagName === 'DIV' && el.querySelector('[class*="video-card"], [class*="info-title"]')) : [];
+    console.log(`[Auto Upload] 抖音列表：共加载 ${cards.length} 条记录`);
+
+    for (const card of cards) {
+      // 标题
+      const titleEl = card.querySelector('[class*="info-title-text"]');
+      const title = titleEl ? titleEl.textContent.trim() : '';
+
+      // 时间
+      const timeEl = card.querySelector('[class*="info-time"]');
+      const publishTime = timeEl ? timeEl.textContent.trim() : '';
+
+      // 封面
+      let coverUrl = '';
+      const coverImg = card.querySelector('[class*="video-card-cover"] img');
+      if (coverImg) coverUrl = coverImg.src || '';
+      // fallback: background-image
+      if (!coverUrl) {
+        const coverEl = card.querySelector('[class*="video-card-cover"]');
+        if (coverEl) {
+          // 查找带 background-image 的子元素
+          const bgEl = coverEl.querySelector('[style*="background"]') || coverEl;
+          const bg = bgEl.style.backgroundImage || getComputedStyle(bgEl).backgroundImage;
+          const bgMatch = bg && bg.match(/url\(["']?(.*?)["']?\)/);
+          if (bgMatch) coverUrl = bgMatch[1];
+        }
+      }
+
+      // post_id：从卡片内的链接、data 属性、或 DOM 属性提取
+      let postId = '';
+      const allLinks = card.querySelectorAll('a[href]');
+      for (const a of allLinks) {
+        const m = a.href.match(/\/(?:video|content|item)\/(\d+)/);
+        if (m) { postId = m[1]; break; }
+      }
+      if (!postId) {
+        postId = card.getAttribute('data-id') || card.getAttribute('data-video-id') || '';
+      }
+      if (!postId) {
+        // 从所有子元素的 data 属性搜索
+        const idEl = card.querySelector('[data-id],[data-video-id],[data-item-id]');
+        if (idEl) postId = idEl.getAttribute('data-id') || idEl.getAttribute('data-video-id') || idEl.getAttribute('data-item-id') || '';
+      }
+      if (!postId) {
+        postId = title ? 'title_' + title.substring(0, 20) : '';
+      }
+
+      // 状态
+      const cardText = card.innerText || '';
+      let pubStatus = 'published';
+      if (/审核中/.test(cardText)) pubStatus = '审核中';
+      else if (/定时发布/.test(cardText)) pubStatus = 'scheduled';
+      else if (/草稿/.test(cardText)) pubStatus = 'draft';
+      else if (/未通过/.test(cardText)) pubStatus = '未通过';
+      else if (/私密/.test(cardText)) pubStatus = '私密';
+
+      if (statusFilter) {
+        if (statusFilter !== pubStatus) continue;
+      }
+
+      // 数据（播放、点赞、评论、分享）
+      const metricEls = card.querySelectorAll('[class*="metric"]');
+      const metrics = {};
+      for (const mel of metricEls) {
+        const text = mel.innerText.trim();
+        const match = text.match(/(播放|点赞|评论|分享)\s*\n?\s*(\d[\d,.万亿]*)/);
+        if (match) metrics[match[1]] = match[2];
+      }
+
+      posts.push({
+        post_id: postId,
+        title,
+        status: pubStatus,
+        publish_time: publishTime,
+        cover_url: coverUrl,
+        metrics,
+      });
+    }
+
+    return { status: 'ok', posts };
+  }
+
+  // 抖音管理页：根据 post_id 或标题找到目标卡片
+  function douyinFindCard(postId) {
+    const container = document.querySelector('[class*="content-body"]');
+    if (!container) return null;
+    const cards = Array.from(container.children).filter(el => el.tagName === 'DIV');
+    for (const card of cards) {
+      // 通过链接里的 ID 匹配
+      const allLinks = card.querySelectorAll('a[href]');
+      for (const a of allLinks) {
+        if (a.href.includes(postId)) return card;
+      }
+      // 通过 data 属性匹配
+      if (card.getAttribute('data-id') === postId || card.getAttribute('data-video-id') === postId) return card;
+      // 通过 title_ 前缀匹配（list_posts 生成的标题 ID）
+      if (postId.startsWith('title_')) {
+        const titleEl = card.querySelector('[class*="info-title-text"]');
+        if (titleEl && titleEl.textContent.trim().startsWith(postId.substring(6))) return card;
+      }
+    }
+    return null;
+  }
+
+  async function douyinEditPost(taskId, meta) {
+    await douyinWaitForList();
+
+    const postId = meta.post_id;
+    if (!postId) return { status: 'error', error: '缺少 post_id' };
+
+    const targetCard = douyinFindCard(postId);
+    if (!targetCard) return { status: 'error', error: `找不到 post_id=${postId} 的内容` };
+
+    // 点击编辑按钮（已发布="编辑作品"，定时发布="继续编辑"）
+    const editBtn = Array.from(targetCard.querySelectorAll('div,span,button')).find(
+      el => el.offsetParent && el.childElementCount === 0 && /^(编辑作品|继续编辑|编辑)$/.test((el.textContent || '').trim())
+    );
+    if (!editBtn) {
+      return { status: 'error', error: '找不到编辑按钮（审核中的作品无法编辑）' };
+    }
+    editBtn.click();
+
+    // 等待编辑页面加载
+    await sleep(3000);
+    for (let i = 0; i < 30; i++) {
+      const titleInput = document.querySelector(
+        'input[placeholder*="标题"], input[placeholder*="作品标题"], [class*="title-input"] input'
+      );
+      const descEditor = document.querySelector(
+        '.editor-kit-container[contenteditable="true"], [contenteditable="true"][class*="editor"], [class*="notranslate"][contenteditable="true"]'
+      );
+      if (titleInput || descEditor) break;
+      await sleep(1000);
+    }
+    await sleep(1000);
+
+    const editMeta = meta.meta || {};
+
+    // 修改标题
+    if (editMeta.title !== undefined) {
+      const titleEl = document.querySelector(
+        'input[placeholder*="标题"], input[placeholder*="作品标题"], [class*="title-input"] input'
+      );
+      if (titleEl) {
+        const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        nativeSetter.call(titleEl, editMeta.title);
+        titleEl.dispatchEvent(new Event('input', { bubbles: true }));
+        titleEl.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    // 修改描述 + 标签
+    if (editMeta.description !== undefined || (editMeta.tags && editMeta.tags.length > 0)) {
+      const descEl = document.querySelector(
+        '.editor-kit-container[contenteditable="true"], [contenteditable="true"][class*="editor"], [class*="notranslate"][contenteditable="true"]'
+      );
+      if (descEl) {
+        descEl.focus();
+        await sleep(300);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        await sleep(200);
+
+        if (editMeta.description) {
+          document.execCommand('insertText', false, editMeta.description);
+          descEl.dispatchEvent(new Event('input', { bubbles: true }));
+          await sleep(300);
+        }
+
+        if (editMeta.tags && editMeta.tags.length > 0) {
+          if (editMeta.description) {
+            document.execCommand('insertText', false, ' ');
+            await sleep(200);
+          }
+          for (const tag of editMeta.tags) {
+            document.execCommand('insertText', false, `#${tag}`);
+            descEl.dispatchEvent(new Event('input', { bubbles: true }));
+            let topicPopup = null;
+            for (let i = 0; i < 8; i++) {
+              await sleep(300);
+              topicPopup = document.querySelector('[class*="topic-container"], [class*="topic-list"], [class*="mention-list"]');
+              if (topicPopup) break;
+            }
+            if (topicPopup) {
+              const firstItem = topicPopup.querySelector('[class*="item"], [class*="option"], li');
+              if (firstItem) { firstItem.click(); await sleep(400); }
+              descEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+              descEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', keyCode: 13, bubbles: true }));
+              await sleep(300);
+            } else {
+              document.execCommand('insertText', false, ' ');
+              await sleep(200);
+            }
+          }
+        }
+      }
+    }
+
+    // 点击保存/发布
+    await sleep(500);
+    document.body.click();
+    await sleep(500);
+
+    const saveBtns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent);
+    for (const btn of saveBtns) {
+      const text = (btn.textContent || '').trim();
+      if (text === '保存' || text === '发布' || text === '确认') {
+        btn.click();
+        await sleep(2000);
+        break;
+      }
+    }
+
+    return { status: 'ok' };
+  }
+
+  async function douyinDeletePost(taskId, meta) {
+    await douyinScrollLoadAll();
+
+    const postId = meta.post_id;
+    if (!postId) return { status: 'error', error: '缺少 post_id' };
+
+    const targetCard = douyinFindCard(postId);
+    if (!targetCard) return { status: 'error', error: `找不到 post_id=${postId} 的内容` };
+
+    // 点击"删除作品"按钮（卡片内直接有此按钮）
+    const delBtn = Array.from(targetCard.querySelectorAll('div,span,button')).find(
+      el => el.offsetParent && el.childElementCount === 0 && (el.textContent || '').trim() === '删除作品'
+    );
+    if (!delBtn) return { status: 'error', error: '找不到删除作品按钮' };
+    delBtn.click();
+    await sleep(1000);
+
+    // 确认删除弹窗
+    const confirmBtns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent);
+    for (const btn of confirmBtns) {
+      const text = (btn.textContent || '').trim();
+      if (text === '确认' || text === '确定' || text === '删除' || text === '确认删除') {
+        btn.click();
+        await sleep(1500);
+        return { status: 'ok' };
+      }
+    }
+
+    return { status: 'error', error: '未找到删除确认按钮' };
+  }
+
+  // 抖音删除单个卡片的通用函数
+  async function douyinDeleteCard(card) {
+    const delBtn = Array.from(card.querySelectorAll('div,span,button')).find(
+      el => el.offsetParent && el.childElementCount === 0 && (el.textContent || '').trim() === '删除作品'
+    );
+    if (!delBtn) return false;
+    delBtn.click();
+    await sleep(1000);
+
+    // 确认删除弹窗
+    const confirmBtns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent);
+    for (const btn of confirmBtns) {
+      const text = (btn.textContent || '').trim();
+      if (text === '确认' || text === '确定' || text === '删除' || text === '确认删除') {
+        btn.click();
+        await sleep(1500);
+        return true;
+      }
+    }
+    // 关闭可能的弹窗
+    for (const btn of confirmBtns) {
+      const text = (btn.textContent || '').trim();
+      if (text === '取消' || text === '关闭') { btn.click(); break; }
+    }
+    await sleep(500);
+    return false;
+  }
+
+  async function douyinDeleteAllPosts(taskId, meta) {
+    await douyinScrollLoadAll();
+
+    let deleted = 0, failed = 0;
+
+    while (true) {
+      const container = document.querySelector('[class*="content-body"]');
+      const cards = container ? Array.from(container.children).filter(el => el.tagName === 'DIV' && el.querySelector('[class*="info-title"]')) : [];
+      if (cards.length === 0) break;
+
+      const ok = await douyinDeleteCard(cards[0]);
+      if (ok) {
+        deleted++;
+      } else {
+        failed++;
+        if (failed > 5) break; // 连续失败太多次就停止
+      }
+    }
+
+    return { status: 'ok', deleted, failed };
+  }
+
+  async function douyinDeleteBatch(taskId, meta) {
+    const postIds = meta.post_ids || [];
+    if (!postIds.length) return { status: 'error', error: '缺少 post_ids' };
+
+    await douyinScrollLoadAll();
+
+    let deleted = 0, failed = 0, notFound = 0;
+
+    for (const postId of postIds) {
+      const targetCard = douyinFindCard(postId);
+      if (!targetCard) { notFound++; continue; }
+
+      const ok = await douyinDeleteCard(targetCard);
+      if (ok) {
+        deleted++;
+      } else {
+        failed++;
+      }
+    }
+
+    return { status: 'ok', deleted, failed, not_found: notFound };
   }
 
   // -------------------------------------------------------------------------

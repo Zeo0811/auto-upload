@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Auto Upload",
-  "version": "1.6.0",
+  "version": "1.8.0",
   "description": "自动上传视频到多平台创作中心（小红书、抖音、视频号等）",
   "icons": {
     "16": "icons/icon16.png",
@@ -18,6 +18,7 @@
   "host_permissions": [
     "https://creator.xiaohongshu.com/*",
     "https://creator.douyin.com/*",
+    "https://*.douyin.com/*",
     "https://channels.weixin.qq.com/*",
     "http://127.0.0.1:7788/*"
   ],
@@ -29,6 +30,7 @@
       "matches": [
         "https://creator.xiaohongshu.com/*",
         "https://creator.douyin.com/*",
+        "https://*.douyin.com/*",
         "https://channels.weixin.qq.com/*"
       ],
       "js": [

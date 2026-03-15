@@ -19,4 +19,5 @@ PLATFORM_URLS = {
 PLATFORM_MANAGE_URLS = {
     "xiaohongshu": "https://creator.xiaohongshu.com/new/note-manager",
     "channels":    "https://channels.weixin.qq.com/platform/post/list",
+    "douyin":      "https://creator.douyin.com/creator-micro/content/manage",
 }

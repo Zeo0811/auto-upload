@@ -30,4 +30,4 @@
 ## Supported Platforms
 - xiaohongshu (小红书)
 - channels (视频号)
-- douyin (抖音) - planned
+- douyin (抖音)
