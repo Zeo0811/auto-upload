@@ -542,8 +542,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // closeTab: 已禁用
+  // closeTab: 操作完成后关闭当前标签页
   if (msg.type === 'closeTab') {
+    if (sender.tab && sender.tab.id) {
+      chrome.tabs.remove(sender.tab.id);
+    }
     return false;
   }
 

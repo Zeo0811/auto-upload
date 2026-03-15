@@ -265,6 +265,7 @@
         const loggedIn = await checkAndHandleLogin('manage_' + platform);
         if (!loggedIn) {
           await postJSON('/task_result', { task_id, status: 'error', error: '登录失败' });
+          chrome.runtime.sendMessage({ type: 'closeTab' });
           return;
         }
         // 登录成功后等待页面跳转到管理页
@@ -276,11 +277,14 @@
         if (manageType === 'list_posts')  result = await xhsListPosts(task_id, meta);
         else if (manageType === 'edit_post')   result = await xhsEditPost(task_id, meta);
         else if (manageType === 'delete_post') result = await xhsDeletePost(task_id, meta);
+        else if (manageType === 'delete_all_posts') result = await xhsDeleteAllPosts(task_id, meta);
+        else if (manageType === 'delete_batch') result = await xhsDeleteBatch(task_id, meta);
         else throw new Error(`不支持的管理操作: ${manageType}`);
       } else if (platform === 'channels') {
         if (manageType === 'list_posts')  result = await channelsListPosts(task_id, meta);
         else if (manageType === 'edit_post')   result = await channelsEditPost(task_id, meta);
         else if (manageType === 'delete_post') result = await channelsDeletePost(task_id, meta);
+        else if (manageType === 'delete_all_posts') result = await channelsDeleteAllPosts(task_id, meta);
         else if (manageType === 'channels_edit_continue') {
           await channelsEditContinue(task_id, meta);
           result = { status: 'ok' };
@@ -292,10 +296,13 @@
       // _deferred 表示结果由后续任务回传（如视频号编辑跳转）
       if (!result?._deferred) {
         await postJSON('/task_result', { task_id, ...result });
+        // 操作完成后关闭当前标签页，避免堆积
+        chrome.runtime.sendMessage({ type: 'closeTab' });
       }
     } catch (e) {
       console.error('[Auto Upload] 管理操作失败:', e);
       await postJSON('/task_result', { task_id, status: 'error', error: e.message });
+      chrome.runtime.sendMessage({ type: 'closeTab' });
     }
   }
 
@@ -722,10 +729,12 @@
       const postUrl = location.href;
       navigator.sendBeacon(BASE_URL + '/done', JSON.stringify({ task_id, post_url: postUrl }));
       console.log('[Auto Upload] 任务完成', task_id);
+      chrome.runtime.sendMessage({ type: 'closeTab' });
 
     } catch (e) {
       console.error('[Auto Upload] 任务失败', task_id, e);
       navigator.sendBeacon(BASE_URL + '/fail', JSON.stringify({ task_id, error: e.message || String(e) }));
+      chrome.runtime.sendMessage({ type: 'closeTab' });
     }
   }
 
@@ -1159,10 +1168,12 @@
       const postUrl = location.href;
       navigator.sendBeacon(BASE_URL + '/done', JSON.stringify({ task_id, post_url: postUrl }));
       console.log('[Auto Upload] 视频号任务完成', task_id);
+      chrome.runtime.sendMessage({ type: 'closeTab' });
 
     } catch (e) {
       console.error('[Auto Upload] 视频号任务失败', task_id, e);
       navigator.sendBeacon(BASE_URL + '/fail', JSON.stringify({ task_id, error: e.message || String(e) }));
+      chrome.runtime.sendMessage({ type: 'closeTab' });
     }
   }
 
@@ -1479,12 +1490,34 @@
     return { status: 'ok' };
   }
 
-  async function xhsDeletePost(taskId, meta) {
+  async function xhsScrollLoadAll() {
+    // 等待初始笔记出现
     for (let i = 0; i < 30; i++) {
       if (document.querySelectorAll('.note').length > 0) break;
       await sleep(1000);
     }
     await sleep(1000);
+    // 滚动直到全部加载
+    const scrollContainer = document.querySelector('.content') || document.documentElement;
+    let prevCount = 0, stableRounds = 0;
+    for (let i = 0; i < 100; i++) {
+      const currentCount = document.querySelectorAll('.note').length;
+      if (currentCount === prevCount) {
+        stableRounds++;
+        if (stableRounds >= 3) break;
+      } else {
+        stableRounds = 0;
+        prevCount = currentCount;
+      }
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      await sleep(1000);
+    }
+    scrollContainer.scrollTop = 0;
+    await sleep(500);
+  }
+
+  async function xhsDeletePost(taskId, meta) {
+    await xhsScrollLoadAll();
 
     const postId = meta.post_id;
     if (!postId) return { status: 'error', error: '缺少 post_id' };
@@ -1521,6 +1554,106 @@
       } catch (e) {}
     }
     return null;
+  }
+
+  async function xhsDeleteAllPosts(taskId, meta) {
+    // 滚动加载全部笔记
+    await xhsScrollLoadAll();
+
+    let deleted = 0, failed = 0;
+
+    // 反复删除直到没有笔记为止（每次删后页面会减少一条）
+    while (true) {
+      const rows = document.querySelectorAll('.note');
+      if (rows.length === 0) break;
+
+      const row = rows[0];
+      const delBtn = row.querySelector('.data-del');
+      if (!delBtn) {
+        // 该行没有删除按钮（可能是审核中），跳过
+        failed++;
+        if (failed > rows.length) break;  // 防止死循环
+        continue;
+      }
+
+      delBtn.click();
+      await sleep(800);
+
+      // 确认弹窗
+      const confirmBtns = document.querySelectorAll('.d-dialog button, .d-modal button, [class*="dialog"] button, [class*="modal"] button');
+      let confirmed = false;
+      for (const btn of confirmBtns) {
+        const text = (btn.textContent || '').trim();
+        if (text === '确认' || text === '确定' || text === '删除') {
+          btn.click();
+          confirmed = true;
+          deleted++;
+          await sleep(1200);
+          break;
+        }
+      }
+
+      if (!confirmed) {
+        // 关掉弹窗（ESC 或点取消）
+        const cancelBtns = document.querySelectorAll('.d-dialog button, .d-modal button, [class*="dialog"] button, [class*="modal"] button');
+        for (const btn of cancelBtns) {
+          const text = (btn.textContent || '').trim();
+          if (text === '取消' || text === '关闭') { btn.click(); break; }
+        }
+        failed++;
+        await sleep(500);
+      }
+    }
+
+    return { status: 'ok', deleted, failed };
+  }
+
+  // 小红书：按 post_id 列表批量删除，全部删完后关标签
+  async function xhsDeleteBatch(taskId, meta) {
+    const postIds = meta.post_ids || [];
+    if (!postIds.length) return { status: 'error', error: '缺少 post_ids' };
+
+    // 滚动加载全部笔记
+    await xhsScrollLoadAll();
+
+    let deleted = 0, failed = 0, notFound = 0;
+
+    for (const postId of postIds) {
+      // 每次删除后 DOM 会更新，重新查找
+      const row = xhsFindNoteByPostId(postId);
+      if (!row) { notFound++; continue; }
+
+      const delBtn = row.querySelector('.data-del');
+      if (!delBtn) { failed++; continue; }
+
+      delBtn.click();
+      await sleep(800);
+
+      const confirmBtns = document.querySelectorAll('.d-dialog button, .d-modal button, [class*="dialog"] button, [class*="modal"] button');
+      let confirmed = false;
+      for (const btn of confirmBtns) {
+        const text = (btn.textContent || '').trim();
+        if (text === '确认' || text === '确定' || text === '删除') {
+          btn.click();
+          confirmed = true;
+          deleted++;
+          await sleep(1200);
+          break;
+        }
+      }
+      if (!confirmed) {
+        // 关掉弹窗
+        const cancelBtns = document.querySelectorAll('.d-dialog button, .d-modal button, [class*="dialog"] button, [class*="modal"] button');
+        for (const btn of cancelBtns) {
+          const text = (btn.textContent || '').trim();
+          if (text === '取消' || text === '关闭') { btn.click(); break; }
+        }
+        failed++;
+        await sleep(500);
+      }
+    }
+
+    return { status: 'ok', deleted, failed, not_found: notFound };
   }
 
   // -------------------------------------------------------------------------
@@ -2580,6 +2713,35 @@
     }
 
     return { status: 'error', error: '未找到删除确认按钮' };
+  }
+
+  // 视频号：批量删除所有内容，在同一个进程里反复删第一条直到清空
+  async function channelsDeleteAllPosts(taskId, meta) {
+    let deleted = 0, failed = 0;
+
+    while (true) {
+      // 等待列表加载
+      let count = 0;
+      for (let i = 0; i < 15; i++) {
+        count = await channelsRunInIframe('return doc.querySelectorAll(".post-feed-item").length;');
+        if (count && count > 0) break;
+        await sleep(1000);
+      }
+      if (!count || count === 0) break;  // 没有更多了
+
+      // 删除第一条（index=0）
+      const r = await channelsDeletePost(taskId, { post_id: '0' });
+      if (r.status === 'ok') {
+        deleted++;
+        await sleep(1000);
+      } else {
+        failed++;
+        if (failed > 5) break;  // 连续失败 5 次，退出
+        await sleep(2000);
+      }
+    }
+
+    return { status: 'ok', deleted, failed };
   }
 
   // -------------------------------------------------------------------------

@@ -359,6 +359,34 @@ def delete_post(platform: str, account_id: str, post_id: str) -> dict:
     })
 
 
+def delete_all_posts(platform: str, account_id: str) -> dict:
+    """
+    删除当前账号所有内容（一次 Chrome 会话批量处理）。
+
+    返回:
+      {"status": "ok", "deleted": N, "failed": M} 或 {"status": "error", "error": "..."}
+    """
+    return _submit_manage_task(platform, account_id, "delete_all_posts", {}, timeout=600)
+
+
+def delete_batch(platform: str, account_id: str, post_ids: list) -> dict:
+    """
+    按 post_id 列表批量删除（一次 Chrome 会话处理完再关标签）。
+    小红书：post_ids 为 noteId 列表。
+    视频号：传空列表会调用 delete_all_posts。
+
+    返回:
+      {"status": "ok", "deleted": N, "failed": M, "not_found": K}
+    """
+    if platform == "xiaohongshu":
+        return _submit_manage_task(platform, account_id, "delete_batch", {
+            "post_ids": post_ids,
+        }, timeout=600)
+    else:
+        # 视频号用 delete_all_posts（按索引删，不用 ID）
+        return _submit_manage_task(platform, account_id, "delete_all_posts", {}, timeout=600)
+
+
 # ====================================================================== #
 # 7. 工具函数
 # ====================================================================== #
