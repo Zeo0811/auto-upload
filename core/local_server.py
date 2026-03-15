@@ -157,6 +157,29 @@ class _Handler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
             return
 
+        # GET /qr/<account_id> → 返回二维码图片（供浏览器直接打开）
+        if path.startswith("/qr/"):
+            account_id = path[len("/qr/"):]
+            qr_dir = BASE_DIR / "tmp"
+            # 尝试多种命名：直接 account_id、manage_ 前缀
+            for name in [f"qr_{account_id}.png", f"qr_manage_{account_id}.png"]:
+                qr_path = str(qr_dir / name)
+                if os.path.isfile(qr_path):
+                    size = os.path.getsize(qr_path)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Cache-Control", "no-cache")
+                    self._cors_headers()
+                    self.end_headers()
+                    with open(qr_path, "rb") as f:
+                        self.wfile.write(f.read())
+                    return
+            self.send_response(404)
+            self._cors_headers()
+            self.end_headers()
+            return
+
         self.send_response(404)
         self._cors_headers()
         self.end_headers()

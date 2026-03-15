@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.6.0 (2026-03-15)
+
+### New Features — MCP & AI Agent 优化
+- **`login_and_wait` MCP tool**: 一次调用返回 QR 二维码（base64 data URL + HTTP URL），解决 AI 获取二维码发送到 IM 耗时过长的问题
+- **`upload_and_wait` MCP tool**: 提交上传 + 自动轮询等待完成，无需 AI 反复调用 `get_task_status`
+- **`delete_batch` / `delete_all_posts` MCP tools**: 补齐批量删除接口
+- **`GET /qr/{account_id}` HTTP 端点**: 浏览器直接访问 `http://127.0.0.1:7788/qr/test` 查看登录二维码，AI 只需发一个 URL 给用户
+
+### New Features — Claude Code Skills & 打包
+- **Claude Code Skills** (`.claude/commands/`): `/upload`、`/batch-upload`、`/manage` 三个快捷指令
+- **`CLAUDE.md`**: 项目架构说明，Claude Code 自动读取
+- **`pyproject.toml`**: pip 安装打包配置，支持 `pip install .` 或 `auto-upload-server` 命令启动
+
+### Bug Fixes
+- 修复管理操作（查询/编辑/删除）登录成功后标签页已关闭但未重新打开管理页面的问题
+- 修复小红书描述不填写：编辑器选择器从 `.ql-editor` 更新为 `.tiptap.ProseMirror`（适配新版编辑器）
+- 修复小红书话题弹窗选择器过时 + 最后一个话题选择框关不掉
+
+### Improvements
+- MCP Server 重构：13 个 tool（原 9 个 + 新增 4 个），快捷版优先、基础版兼容
+- 管理操作登录后自动重新打开页面 + 重新投递任务
+
 ## v1.5.0 (2026-03-15)
 
 ### New Features

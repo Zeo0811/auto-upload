@@ -420,7 +420,13 @@ def _submit_manage_task(platform: str, account_id: str, manage_type: str, params
                     save_session(platform, account_id, {'logged_in': True})
                     clear_login_state(manage_account)
                     login_handled = True
-                    print(f"[管理操作] 登录成功，继续执行...")
+                    print(f"[管理操作] 登录成功，重新打开管理页面...")
+                    # 登录后标签页已关闭，需要重新打开管理页面并重新投递任务
+                    if manage_url:
+                        subprocess.run(["open", "-a", "Google Chrome", manage_url], capture_output=True)
+                    time.sleep(4)
+                    clear_manage_result(task_id)
+                    post_task(task_id, "", manage_meta, platform)
 
     return {"status": "error", "error": "管理操作超时"}
 
