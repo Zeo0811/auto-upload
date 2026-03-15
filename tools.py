@@ -58,7 +58,6 @@ def login(platform: str, account_id: str) -> dict:
             return {'status': 'ok'}
         if status == 'qr_required':
             qr_path = state.get('qr_path', '')
-            if qr_path:
             return {'status': 'qr_required', 'qr_path': qr_path}
         if status == 'error':
             return {'status': 'error', 'error': state.get('error', '登录检测失败')}
@@ -191,7 +190,6 @@ def check_login(platform: str, account_id: str) -> dict:
                     new_status = new_state.get('status')
                     if new_status == 'qr_required':
                         qr_path = new_state.get('qr_path', '')
-                        if qr_path:
                         return {
                             'status': 'qr_refreshed',
                             'qr_path': qr_path,
@@ -417,9 +415,7 @@ def _submit_manage_task(platform: str, account_id: str, manage_type: str, params
                 status = state.get('status')
                 if status == 'qr_required':
                     qr_path = state.get('qr_path', '')
-                    if qr_path:
-                        import os
-                        print(f"[管理操作] 需要重新登录，请扫码...")
+                    print(f"[管理操作] 需要重新登录，请扫码: {qr_path}")
                 elif status in ('ok', 'confirmed'):
                     save_session(platform, account_id, {'logged_in': True})
                     clear_login_state(manage_account)
