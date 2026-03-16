@@ -1322,74 +1322,83 @@
         `);
         await sleep(1000);
 
-        // 点击日期输入框打开日期选择器
+        // 点击日期输入框打开选择器（注意: placeholder 是"请选择发表时间"或"请选择时间"）
         await chrome.runtime.sendMessage({
           type: 'cdpClickIframe',
-          selector: '.weui-desktop-form__input[placeholder="请选择发表时间"]',
+          selector: '.weui-desktop-form__input[placeholder*="选择"]',
         });
         await sleep(1000);
 
         // 选择日期
+        const targetMonth = String(parseInt(datePart.split('-')[1], 10));
         await runInPage(`
           (function() {
             var doc = document.querySelector('iframe').contentDocument;
-            var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
-            for (var i = 0; i < links.length; i++) {
-              var a = links[i];
-              if (a.classList.contains('weui-desktop-picker__disabled')) continue;
-              if (a.classList.contains('weui-desktop-picker__faded')) continue;
-              if (a.textContent.trim() === ${JSON.stringify(dayNum)}) {
-                a.click();
-                break;
-              }
+            var dayNum = ${JSON.stringify(dayNum)};
+            var targetMonth = ${JSON.stringify(targetMonth)};
+            var monthEl = doc.querySelector('.weui-desktop-picker__panel_month .weui-desktop-picker__selected');
+            var curMonth = monthEl ? String(parseInt(monthEl.textContent, 10)) : '';
+            if (curMonth && curMonth !== targetMonth) {
+              var nextBtn = doc.querySelector('.weui-desktop-picker__panel_day .weui-desktop-picker__arrow_right') ||
+                            doc.querySelector('.weui-desktop-picker__arrow:last-child');
+              if (nextBtn) nextBtn.click();
             }
+            setTimeout(function() {
+              var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+              for (var i = 0; i < links.length; i++) {
+                var a = links[i];
+                if (a.classList.contains('weui-desktop-picker__disabled') || a.classList.contains('weui-desktop-picker__faded')) continue;
+                if (a.textContent.trim() === dayNum) { a.click(); break; }
+              }
+            }, 300);
           })()
         `);
-        await sleep(500);
+        await sleep(800);
 
-        // 点击时间区域展开时间面板
+        // 点击时间区域头部展开时间滚轮选择器
         await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-picker__dt' });
         await sleep(1000);
 
-        // 选择小时：滚动到目标并模拟完整鼠标事件
-        await runInPage(`
+        // 尝试通过 CDP 滚轮选择时间（已知问题：视频号时间选择器的精确时间设置暂不生效，日期选择正常）
+        const currentTime = await runInPage(`
           (function() {
             var doc = document.querySelector('iframe').contentDocument;
-            var hours = doc.querySelectorAll('.weui-desktop-picker__time__hour li');
-            for (var i = 0; i < hours.length; i++) {
-              if (hours[i].classList.contains('weui-desktop-picker__disabled')) continue;
-              if (hours[i].textContent.trim() === ${JSON.stringify(hourStr)}) {
-                hours[i].scrollIntoView({ block: 'center' });
-                hours[i].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                hours[i].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                hours[i].dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                break;
-              }
-            }
+            var selH = doc.querySelector('.weui-desktop-picker__time__hour .weui-desktop-picker__selected');
+            var selM = doc.querySelector('.weui-desktop-picker__time__minute .weui-desktop-picker__selected');
+            return {
+              hour: selH ? parseInt(selH.textContent.trim(), 10) : -1,
+              minute: selM ? parseInt(selM.textContent.trim(), 10) : -1,
+            };
           })()
         `);
-        await sleep(500);
+        const curHour = currentTime?.result?.hour ?? -1;
+        const curMin = currentTime?.result?.minute ?? 0;
+        const tgtHour = parseInt(targetHour, 10);
+        const tgtMin = parseInt(targetMin, 10);
+        const hourDiff = tgtHour - curHour;
+        const minDiff = tgtMin - curMin;
 
-        // 选择分钟
-        await runInPage(`
-          (function() {
-            var doc = document.querySelector('iframe').contentDocument;
-            var mins = doc.querySelectorAll('.weui-desktop-picker__time__minute li');
-            for (var i = 0; i < mins.length; i++) {
-              if (mins[i].classList.contains('weui-desktop-picker__disabled')) continue;
-              if (mins[i].textContent.trim() === ${JSON.stringify(minStr)}) {
-                mins[i].scrollIntoView({ block: 'center' });
-                mins[i].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                mins[i].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                mins[i].dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                break;
-              }
-            }
-          })()
-        `);
-        await sleep(500);
+        const DELTA_PER_ITEM = 40;
+        if (hourDiff !== 0) {
+          const steps = Math.abs(hourDiff);
+          const delta = hourDiff > 0 ? DELTA_PER_ITEM : -DELTA_PER_ITEM;
+          for (let s = 0; s < steps; s++) {
+            await chrome.runtime.sendMessage({ type: 'cdpScrollIframe', selector: '.weui-desktop-picker__dd__time', deltaY: delta });
+            await sleep(200);
+          }
+          await sleep(500);
+        }
+        if (minDiff !== 0) {
+          const steps = Math.abs(minDiff);
+          const delta = minDiff > 0 ? DELTA_PER_ITEM : -DELTA_PER_ITEM;
+          for (let s = 0; s < steps; s++) {
+            await chrome.runtime.sendMessage({ type: 'cdpScrollIframe', selector: '.weui-desktop-picker__time__minute', deltaY: delta });
+            await sleep(100);
+          }
+          await sleep(500);
+        }
 
-        // 关闭弹窗
+        // 点击空白关闭选择器
         await runInPage(`
           (function() {
             var doc = document.querySelector('iframe').contentDocument;
@@ -2910,7 +2919,8 @@
         const dayNum = String(parseInt(targetDay, 10));
         const hourStr = String(parseInt(targetHour, 10)).padStart(2, '0');
         const minStr = String(parseInt(targetMin, 10)).padStart(2, '0');
-        console.log(`[Auto Upload] 视频号编辑：定时发布解析 原始值="${editMeta.publish_time}" 日=${dayNum} 时=${hourStr} 分=${minStr}`);
+        const editTargetMonth = String(parseInt(datePart.split('-')[1], 10));
+        console.log(`[Auto Upload] 视频号编辑：定时发布解析 原始值="${editMeta.publish_time}" 月=${editTargetMonth} 日=${dayNum} 时=${hourStr} 分=${minStr}`);
 
         // 点击"定时发布"单选按钮
         await runInPage(`(function() {
@@ -2931,13 +2941,34 @@
         });
         await sleep(1000);
 
-        // 选择日期
+        // 选择日期（支持跨月）
         await runInPage(`(function() {
           var iframes = document.querySelectorAll('iframe');
           for (var i = 0; i < iframes.length; i++) {
             try {
               var doc = iframes[i].contentDocument;
               var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+              if (!links.length) continue;
+
+              // 检查当前显示的月份是否匹配目标月份
+              var monthEl = doc.querySelector('.weui-desktop-picker__panel_month .weui-desktop-picker__selected');
+              var curMonth = monthEl ? String(parseInt(monthEl.textContent, 10)) : '';
+              if (curMonth && curMonth !== ${JSON.stringify(editTargetMonth)}) {
+                var nextBtn = doc.querySelector('.weui-desktop-picker__panel_day .weui-desktop-picker__arrow_right') ||
+                              doc.querySelector('.weui-desktop-picker__arrow:last-child');
+                if (nextBtn) nextBtn.click();
+                // 延迟选择日期（等 UI 更新）
+                setTimeout(function() {
+                  var newLinks = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+                  for (var j = 0; j < newLinks.length; j++) {
+                    var a = newLinks[j];
+                    if (a.classList.contains('weui-desktop-picker__disabled') || a.classList.contains('weui-desktop-picker__faded')) continue;
+                    if (a.textContent.trim() === ${JSON.stringify(dayNum)}) { a.click(); return; }
+                  }
+                }, 300);
+                return;
+              }
+
               for (var j = 0; j < links.length; j++) {
                 var a = links[j];
                 if (a.classList.contains('weui-desktop-picker__disabled') || a.classList.contains('weui-desktop-picker__faded')) continue;
@@ -2946,7 +2977,7 @@
             } catch(e) {}
           }
         })()`);
-        await sleep(500);
+        await sleep(800);
 
         // 点击时间区域展开时间面板
         await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-picker__dt' });
@@ -3269,6 +3300,8 @@
         const hourStr = String(parseInt(targetHour, 10)).padStart(2, '0');
         const minStr = String(parseInt(targetMin, 10)).padStart(2, '0');
 
+        const contTargetMonth = String(parseInt(datePart.split('-')[1], 10));
+
         await runInPage(`
           var r = document.querySelector('iframe').contentDocument.querySelector('.weui-desktop-form__radio[value="1"]');
           if (r) r.click();
@@ -3276,8 +3309,26 @@
         await sleep(1000);
         await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-form__input[placeholder="请选择发表时间"]' });
         await sleep(1000);
+
+        // 选择日期（支持跨月）
         await runInPage(`(function() {
           var doc = document.querySelector('iframe').contentDocument;
+          var monthEl = doc.querySelector('.weui-desktop-picker__panel_month .weui-desktop-picker__selected');
+          var curMonth = monthEl ? String(parseInt(monthEl.textContent, 10)) : '';
+          if (curMonth && curMonth !== ${JSON.stringify(contTargetMonth)}) {
+            var nextBtn = doc.querySelector('.weui-desktop-picker__panel_day .weui-desktop-picker__arrow_right') ||
+                          doc.querySelector('.weui-desktop-picker__arrow:last-child');
+            if (nextBtn) nextBtn.click();
+            setTimeout(function() {
+              var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
+              for (var i = 0; i < links.length; i++) {
+                var a = links[i];
+                if (a.classList.contains('weui-desktop-picker__disabled') || a.classList.contains('weui-desktop-picker__faded')) continue;
+                if (a.textContent.trim() === ${JSON.stringify(dayNum)}) { a.click(); return; }
+              }
+            }, 300);
+            return;
+          }
           var links = doc.querySelectorAll('.weui-desktop-picker__panel_day a');
           for (var i = 0; i < links.length; i++) {
             var a = links[i];
@@ -3285,34 +3336,46 @@
             if (a.textContent.trim() === ${JSON.stringify(dayNum)}) { a.click(); break; }
           }
         })()`);
-        await sleep(500);
+        await sleep(800);
         await chrome.runtime.sendMessage({ type: 'cdpClickIframe', selector: '.weui-desktop-picker__dt' });
         await sleep(1000);
+
+        // 选择小时（通过 scrollTop + 鼠标事件）
         await runInPage(`(function() {
           var doc = document.querySelector('iframe').contentDocument;
-          var hours = doc.querySelectorAll('.weui-desktop-picker__time__hour li');
-          for (var i = 0; i < hours.length; i++) {
-            if (hours[i].classList.contains('weui-desktop-picker__disabled')) continue;
-            if (hours[i].textContent.trim() === ${JSON.stringify(hourStr)}) {
-              hours[i].scrollIntoView({block:'center'});
-              hours[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
-              hours[i].dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
-              hours[i].dispatchEvent(new MouseEvent('click',{bubbles:true}));
+          var ol = doc.querySelector('.weui-desktop-picker__time__hour');
+          if (!ol) return;
+          var items = ol.querySelectorAll('li');
+          for (var i = 0; i < items.length; i++) {
+            if (items[i].classList.contains('weui-desktop-picker__disabled')) continue;
+            if (items[i].textContent.trim() === ${JSON.stringify(hourStr)}) {
+              var liH = items[i].offsetHeight;
+              ol.scrollTop = i * liH;
+              ol.dispatchEvent(new Event('scroll', {bubbles:true}));
+              items[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+              items[i].dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
+              items[i].dispatchEvent(new MouseEvent('click',{bubbles:true}));
               break;
             }
           }
         })()`);
         await sleep(500);
+
+        // 选择分钟
         await runInPage(`(function() {
           var doc = document.querySelector('iframe').contentDocument;
-          var mins = doc.querySelectorAll('.weui-desktop-picker__time__minute li');
-          for (var i = 0; i < mins.length; i++) {
-            if (mins[i].classList.contains('weui-desktop-picker__disabled')) continue;
-            if (mins[i].textContent.trim() === ${JSON.stringify(minStr)}) {
-              mins[i].scrollIntoView({block:'center'});
-              mins[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
-              mins[i].dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
-              mins[i].dispatchEvent(new MouseEvent('click',{bubbles:true}));
+          var ol = doc.querySelector('.weui-desktop-picker__time__minute');
+          if (!ol) return;
+          var items = ol.querySelectorAll('li');
+          for (var i = 0; i < items.length; i++) {
+            if (items[i].classList.contains('weui-desktop-picker__disabled')) continue;
+            if (items[i].textContent.trim() === ${JSON.stringify(minStr)}) {
+              var liH = items[i].offsetHeight;
+              ol.scrollTop = i * liH;
+              ol.dispatchEvent(new Event('scroll', {bubbles:true}));
+              items[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));
+              items[i].dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
+              items[i].dispatchEvent(new MouseEvent('click',{bubbles:true}));
               break;
             }
           }
@@ -3940,6 +4003,28 @@
             await postJSON('/restore_task', task);
             continue;
           }
+
+          // 多标签页保护：检查当前页面是否适合处理该任务类型
+          const isManageTask = !!(task.meta && task.meta._manage_type);
+          const path = location.pathname;
+          const isOnUploadPage = path.includes('/create') || path.includes('/publish') || path.includes('/upload');
+          const isOnManagePage = path.includes('/list') || path.includes('/manage') || path.includes('/note-manager');
+
+          if (!isManageTask && !isOnUploadPage) {
+            // 上传任务需要在上传/创建页面执行，当前页面不适合
+            console.log('[Auto Upload] 当前页面非上传页，放回上传任务:', path);
+            await postJSON('/restore_task', task);
+            await sleep(5000); // 等待正确标签页加载
+            continue;
+          }
+          if (isManageTask && !isOnManagePage) {
+            // 管理任务需要在管理/列表页面执行，当前页面不适合
+            console.log('[Auto Upload] 当前页面非管理页，放回管理任务:', path);
+            await postJSON('/restore_task', task);
+            await sleep(5000); // 等待正确标签页加载
+            continue;
+          }
+
           _running = true;
           try {
             await runTask(task);

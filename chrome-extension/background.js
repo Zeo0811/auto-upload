@@ -395,6 +395,81 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ── cdpScrollIframe: 在 iframe 内元素上模拟鼠标滚轮 ─────────────────
+  if (msg.type === 'cdpScrollIframe') {
+    const tabId = sender.tab.id;
+    const { selector, deltaY } = msg;
+    (async () => {
+      try {
+        await attachDebugger(tabId);
+        // 找到 iframe 内元素的视口坐标
+        const { result: coordResult } = await sendCommand(tabId, 'Runtime.evaluate', {
+          expression: `(function(sel) {
+            function findEl(doc, frame) {
+              var els = doc.querySelectorAll(sel);
+              for (var j = 0; j < els.length; j++) {
+                var r = els[j].getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                  var fRect = frame ? frame.getBoundingClientRect() : { left: 0, top: 0 };
+                  return { x: r.left + r.width / 2 + fRect.left, y: r.top + r.height / 2 + fRect.top };
+                }
+              }
+              return null;
+            }
+            var pos = findEl(document, null);
+            if (pos) return pos;
+            var frames = document.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+              try { pos = findEl(frames[i].contentDocument, frames[i]); if (pos) return pos; } catch(e) {}
+            }
+            return null;
+          })(${JSON.stringify(selector)})`,
+          returnByValue: true,
+        });
+        if (!coordResult || !coordResult.value) throw new Error('找不到: ' + selector);
+        const { x, y } = coordResult.value;
+        // 模拟鼠标滚轮
+        await sendCommand(tabId, 'Input.dispatchMouseEvent', {
+          type: 'mouseWheel', x, y, deltaX: 0, deltaY,
+        });
+        await new Promise(res => chrome.debugger.detach({ tabId }, res));
+        sendResponse({ ok: true, x, y });
+      } catch (e) {
+        chrome.debugger.detach({ tabId }, () => {});
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // ── cdpType: 用 CDP 在当前焦点元素里输入文本 ──────────────────────
+  if (msg.type === 'cdpType') {
+    const tabId = sender.tab.id;
+    const { text } = msg;
+    (async () => {
+      try {
+        await attachDebugger(tabId);
+        // 先选中全部文本 (Cmd+A on Mac)
+        await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 4 });
+        await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 4 });
+        // 删除选中的文本
+        await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+        await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+        // 输入新文本
+        await sendCommand(tabId, 'Input.insertText', { text });
+        // 回车确认
+        await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+        await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+        await new Promise(res => chrome.debugger.detach({ tabId }, res));
+        sendResponse({ ok: true });
+      } catch (e) {
+        chrome.debugger.detach({ tabId }, () => {});
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
   // ── cdpDrag: 用 CDP 模拟拖拽 ─────────────────────────────────────────────
   if (msg.type === 'cdpDrag') {
     const tabId = sender.tab.id;
