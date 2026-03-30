@@ -6,6 +6,7 @@
 import base64
 from typing import Optional
 import json
+import logging
 import os
 import threading
 import tempfile
@@ -15,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from config import BASE_DIR, LOCAL_SERVER_PORT
+
+logger = logging.getLogger("local_server")
 
 _server_started = False
 _server_lock = threading.Lock()
@@ -75,7 +78,8 @@ def _read_json(path: Path) -> Optional[dict]:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("读取 JSON 文件失败 %s: %s", path, e)
         return None
 
 
@@ -342,15 +346,15 @@ class _Handler(BaseHTTPRequestHandler):
                             with open(qr_path, "wb") as f:
                                 f.write(base64.b64decode(qr_base64))
                             saved = True
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("保存 QR base64 图片失败: %s", e)
                     if not saved and qr_url:
                         try:
                             import urllib.request
                             urllib.request.urlretrieve(qr_url, qr_path)
                             saved = True
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("下载 QR URL 图片失败: %s", e)
                     state["qr_path"] = qr_path if saved else ""
                     state["qr_base64"] = body.get("qr_base64", "")
                 elif "error" in body:
@@ -388,6 +392,7 @@ def start_server(port: int = LOCAL_SERVER_PORT):
             t = threading.Thread(target=server.serve_forever, daemon=True)
             t.start()
             _server_started = True
+            logger.info("本地服务已启动: http://127.0.0.1:%d", port)
         except OSError as e:
             if e.errno == 48:  # Address already in use
                 try:
