@@ -4,25 +4,31 @@ Auto Upload — Agent 调用的唯一入口。
 所有函数均为同步，返回 dict，结构固定，Agent 可直接解析。
 """
 import asyncio
+import logging
 import sys
 import os
 import time
 import subprocess
+import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from core.session import load_session, save_session, delete_session
 from core.task_runner import create_task, update_task, get_task, run_task_in_background
-from config import BASE_DIR, TMP_DIR, PLATFORM_MANAGE_URLS
+from config import (
+    BASE_DIR, TMP_DIR, PLATFORM_MANAGE_URLS,
+    CHROME_APP, CHROME_USER_DATA_DIR, CHROME_PROFILE_DIR,
+    TIMEOUT_LOGIN_WAIT, TIMEOUT_LOGOUT_WAIT, TIMEOUT_QR_REFRESH_WAIT,
+    TIMEOUT_UPLOAD, TIMEOUT_MANAGE_DEFAULT, TIMEOUT_MANAGE_DELETE_ALL,
+    TIMEOUT_PAGE_LOAD, MAX_QR_REFRESH,
+)
 
-
-CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CHROME_USER_DATA_DIR = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-CHROME_PROFILE_DIR = "Default"
+logger = logging.getLogger("tools")
 
 
 def _open_chrome(url: str) -> None:
     """Open Chrome using the user's existing Chrome profile."""
+    import platform as _platform
     chrome_args = [
         CHROME_APP,
         f"--user-data-dir={CHROME_USER_DATA_DIR}",
@@ -38,11 +44,21 @@ def _open_chrome(url: str) -> None:
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        subprocess.Popen(
-            ["open", "-a", "Google Chrome", url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        logger.warning("Chrome 未在预期路径找到 (%s)，尝试备用方式打开", CHROME_APP)
+        if _platform.system() == "Darwin":
+            subprocess.Popen(
+                ["open", "-a", "Google Chrome", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif _platform.system() == "Windows":
+            os.startfile(url)
+        else:
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
 
 # ====================================================================== #
@@ -74,8 +90,8 @@ def login(platform: str, account_id: str) -> dict:
     url = PLATFORM_URLS.get(platform, "https://creator.xiaohongshu.com/publish/publish")
     _open_chrome(url)
 
-    # 等插件报告登录状态（最多 30 秒）
-    deadline = time.time() + 90
+    # 等插件报告登录状态
+    deadline = time.time() + TIMEOUT_LOGIN_WAIT
     while time.time() < deadline:
         time.sleep(1)
         state = get_login_state(account_id)
@@ -131,12 +147,12 @@ def logout(platform: str, account_id: str) -> dict:
     url = PLATFORM_URLS.get(platform, "")
     if url:
         _open_chrome(url)
-    time.sleep(5)  # 等标签页加载 + content.js 注入
+    time.sleep(TIMEOUT_PAGE_LOAD + 1)  # 等标签页加载 + content.js 注入
 
     set_logout_request(account_id, platform, domain)
 
-    # 等待插件清除 cookie 完成（最多 30 秒）
-    deadline = time.time() + 30
+    # 等待插件清除 cookie 完成
+    deadline = time.time() + TIMEOUT_LOGOUT_WAIT
     last_set_time = time.time()
     while time.time() < deadline:
         time.sleep(1)
@@ -167,7 +183,7 @@ def logout(platform: str, account_id: str) -> dict:
 # ====================================================================== #
 
 _qr_refresh_count: dict = {}  # account_id → 已刷新次数
-MAX_QR_REFRESH = 3
+_qr_refresh_lock = threading.Lock()
 
 def check_login(platform: str, account_id: str) -> dict:
     """
@@ -185,51 +201,51 @@ def check_login(platform: str, account_id: str) -> dict:
     if not state:
         return {'status': 'pending'}
     status = state.get('status')
-    if status == 'confirmed':
+    if status in ('confirmed', 'ok'):
         save_session(platform, account_id, {'logged_in': True})
-        _qr_refresh_count.pop(account_id, None)
-        return {'status': 'confirmed'}
-    if status == 'ok':
-        save_session(platform, account_id, {'logged_in': True})
-        _qr_refresh_count.pop(account_id, None)
+        with _qr_refresh_lock:
+            _qr_refresh_count.pop(account_id, None)
         return {'status': 'confirmed'}
     if status == 'error':
         error_msg = state.get('error', '')
         # 二维码超时：自动刷新页面重新获取
         if error_msg == 'qr_timeout':
-            count = _qr_refresh_count.get(account_id, 0)
-            if count < MAX_QR_REFRESH:
-                _qr_refresh_count[account_id] = count + 1
-                clear_login_state(account_id)
-                set_login_request(account_id, platform)
-                # 刷新浏览器标签页
-                from config import PLATFORM_URLS
-                url = PLATFORM_URLS.get(platform, "")
-                if url:
-                    _open_chrome(url)
-                # 等待插件重新获取二维码
-                deadline = time.time() + 30
-                while time.time() < deadline:
-                    time.sleep(1)
-                    new_state = get_login_state(account_id)
-                    if not new_state:
-                        continue
-                    new_status = new_state.get('status')
-                    if new_status == 'qr_required':
-                        qr_path = new_state.get('qr_path', '')
-                        return {
-                            'status': 'qr_refreshed',
-                            'qr_path': qr_path,
-                        }
-                    if new_status == 'ok':
-                        save_session(platform, account_id, {'logged_in': True})
+            with _qr_refresh_lock:
+                count = _qr_refresh_count.get(account_id, 0)
+                if count < MAX_QR_REFRESH:
+                    _qr_refresh_count[account_id] = count + 1
+                else:
+                    _qr_refresh_count.pop(account_id, None)
+                    return {'status': 'error', 'error': f'二维码超时，已重试 {MAX_QR_REFRESH} 次'}
+            logger.info("二维码超时，自动刷新（第 %d 次）", count + 1)
+            clear_login_state(account_id)
+            set_login_request(account_id, platform)
+            # 刷新浏览器标签页
+            from config import PLATFORM_URLS
+            url = PLATFORM_URLS.get(platform, "")
+            if url:
+                _open_chrome(url)
+            # 等待插件重新获取二维码
+            deadline = time.time() + TIMEOUT_QR_REFRESH_WAIT
+            while time.time() < deadline:
+                time.sleep(1)
+                new_state = get_login_state(account_id)
+                if not new_state:
+                    continue
+                new_status = new_state.get('status')
+                if new_status == 'qr_required':
+                    qr_path = new_state.get('qr_path', '')
+                    return {
+                        'status': 'qr_refreshed',
+                        'qr_path': qr_path,
+                    }
+                if new_status in ('ok', 'confirmed'):
+                    save_session(platform, account_id, {'logged_in': True})
+                    with _qr_refresh_lock:
                         _qr_refresh_count.pop(account_id, None)
-                        return {'status': 'confirmed'}
-                # 刷新失败
-                return {'status': 'error', 'error': f'二维码刷新失败（第 {count + 1} 次）'}
-            else:
-                _qr_refresh_count.pop(account_id, None)
-                return {'status': 'error', 'error': f'二维码超时，已重试 {MAX_QR_REFRESH} 次'}
+                    return {'status': 'confirmed'}
+            # 刷新失败
+            return {'status': 'error', 'error': f'二维码刷新失败（第 {count + 1} 次）'}
         return {'status': 'error', 'error': error_msg}
     return {'status': 'pending'}
 
@@ -289,9 +305,8 @@ def upload_video(
                 open_url = PLATFORM_URLS.get(platform, "https://creator.xiaohongshu.com/publish/publish")
                 _open_chrome(open_url)
 
-            timeout = 900
             start = time.time()
-            while time.time() - start < timeout:
+            while time.time() - start < TIMEOUT_UPLOAD:
                 await asyncio.sleep(2)
                 prog = get_progress(task_id)
                 if prog.get('progress'):
@@ -308,8 +323,9 @@ def upload_video(
                                     error=result.get('error', 'Unknown'))
                     return
 
-            update_task(task_id, status="failed", error="上传超时(15分钟)")
+            update_task(task_id, status="failed", error=f"上传超时({TIMEOUT_UPLOAD // 60}分钟)")
         except Exception as e:
+            logger.exception("上传任务 %s 异常", task_id)
             update_task(task_id, status="failed", error=str(e))
 
     run_task_in_background(task_id, lambda: _run_upload())
@@ -407,7 +423,7 @@ def _submit_manage_task(platform: str, account_id: str, manage_type: str, params
         _open_chrome(manage_url)
 
     # 等页面加载 + 插件初始化
-    time.sleep(4)
+    time.sleep(TIMEOUT_PAGE_LOAD)
 
     # 发布管理任务（复用 post_task，file_path 为空，通过 meta 传递管理参数）
     manage_meta = {"_manage_type": manage_type, **params}
@@ -437,16 +453,16 @@ def _submit_manage_task(platform: str, account_id: str, manage_type: str, params
                 status = state.get('status')
                 if status == 'qr_required':
                     qr_path = state.get('qr_path', '')
-                    print(f"[管理操作] 需要重新登录，请扫码: {qr_path}")
+                    logger.info("管理操作需要重新登录，请扫码: %s", qr_path)
                 elif status in ('ok', 'confirmed'):
                     save_session(platform, account_id, {'logged_in': True})
                     clear_login_state(manage_account)
                     login_handled = True
-                    print(f"[管理操作] 登录成功，重新打开管理页面...")
+                    logger.info("管理操作登录成功，重新打开管理页面...")
                     # 登录后标签页已关闭，需要重新打开管理页面并重新投递任务
                     if manage_url:
                         _open_chrome(manage_url)
-                    time.sleep(4)
+                    time.sleep(TIMEOUT_PAGE_LOAD)
                     clear_manage_result(task_id)
                     post_task(task_id, "", manage_meta, platform)
 
@@ -502,7 +518,7 @@ def delete_all_posts(platform: str, account_id: str) -> dict:
     返回:
       {"status": "ok", "deleted": N, "failed": M} 或 {"status": "error", "error": "..."}
     """
-    return _submit_manage_task(platform, account_id, "delete_all_posts", {}, timeout=600)
+    return _submit_manage_task(platform, account_id, "delete_all_posts", {}, timeout=TIMEOUT_MANAGE_DELETE_ALL)
 
 
 def delete_batch(platform: str, account_id: str, post_ids: list) -> dict:
@@ -517,10 +533,10 @@ def delete_batch(platform: str, account_id: str, post_ids: list) -> dict:
     if platform in ("xiaohongshu", "douyin"):
         return _submit_manage_task(platform, account_id, "delete_batch", {
             "post_ids": post_ids,
-        }, timeout=600)
+        }, timeout=TIMEOUT_MANAGE_DELETE_ALL)
     else:
         # 视频号用 delete_all_posts（按索引删，不用 ID）
-        return _submit_manage_task(platform, account_id, "delete_all_posts", {}, timeout=600)
+        return _submit_manage_task(platform, account_id, "delete_all_posts", {}, timeout=TIMEOUT_MANAGE_DELETE_ALL)
 
 
 # ====================================================================== #
