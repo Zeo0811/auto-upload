@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.0.0 (2026-03-30)
+
+- 默认本地服务端口调整为 `7790`，支持 `AUTO_UPLOAD_PORT`
+- 本地服务运行时状态改为磁盘共享，修复多进程/多调用方下的状态丢失
+- MCP / OpenClaw 接入增强，新增安装脚本、启动脚本和二维码回发字段
+- 修复扩展关闭标签页时的竞态，避免出现大量 `No tab with given id` / `Tabs cannot be edited right now`
+
 ## v1.8.0 (2026-03-15)
 
 ### New Features — 抖音 (Douyin) 全平台支持（已实测通过）

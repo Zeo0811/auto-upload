@@ -44,6 +44,7 @@ def login_and_wait(platform: str, account_id: str = "test") -> dict:
     - {"status": "ok"} — 已登录，无需扫码
     - {"status": "qr_required", "qr_url": "http://...", "qr_base64": "data:image/png;base64,..."}
       → 展示 qr_url 给用户在浏览器打开扫码，然后调用 check_login 轮询直到 confirmed
+      → 给 OpenClaw/聊天机器人使用时，优先把 channel_message 发回当前会话；若支持图片，再发送 qr_base64
     """
     result = tools.login(platform, account_id)
 
@@ -58,12 +59,21 @@ def login_and_wait(platform: str, account_id: str = "test") -> dict:
             raw = base64.b64encode(f.read()).decode()
             qr_base64 = f"data:image/png;base64,{raw}"
 
+    qr_url = f"{LOCAL_SERVER_BASE_URL}/qr/{account_id}"
+    channel_message = (
+        f"请扫描二维码登录 {platform}/{account_id}\n"
+        f"二维码链接：{qr_url}\n"
+        "如果当前渠道支持图片发送，请同时发送 qr_base64 对应的二维码图片。"
+    )
+
     return {
         "status": "qr_required",
-        "qr_url": f"{LOCAL_SERVER_BASE_URL}/qr/{account_id}",
+        "qr_url": qr_url,
         "qr_base64": qr_base64,
         "qr_path": qr_path,
         "message": "请让用户在浏览器打开 qr_url 扫码登录，然后调用 check_login 轮询状态",
+        "channel_message": channel_message,
+        "channel_image_data_url": qr_base64,
     }
 
 

@@ -194,9 +194,53 @@ python mcp_server.py
 ```
 
 提供的 MCP Tools：
+- `login_and_wait` - 发起登录并直接返回二维码 URL / Base64 / 渠道回发文案
+- `upload_and_wait` - 上传并等待完成
 - `login` - 平台登录
 - `upload_video` - 上传视频
 - `get_task_status` - 查询任务状态
 - `list_posts` - 列表查询
 - `edit_post` - 编辑内容
 - `delete_post` - 删除内容
+
+## OpenClaw 部署
+
+项目已经内置好 OpenClaw 所需的启动脚本和配置模板：
+
+- 启动脚本：[scripts/run_openclaw_mcp.sh](/Users/workstation/auto-upload-main/scripts/run_openclaw_mcp.sh)
+- 一键安装脚本：[scripts/install_openclaw.sh](/Users/workstation/auto-upload-main/scripts/install_openclaw.sh)
+- 批量配置模板：[openclaw/config-set.batch.json](/Users/workstation/auto-upload-main/openclaw/config-set.batch.json)
+- Agent 操作约定：[openclaw/AGENT_INSTRUCTIONS.md](/Users/workstation/auto-upload-main/openclaw/AGENT_INSTRUCTIONS.md)
+
+一键安装：
+
+```bash
+cd /Users/workstation/auto-upload-main && bash scripts/install_openclaw.sh
+```
+
+这会在 OpenClaw 配置里写入：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "auto-upload": {
+        "command": "/Users/workstation/auto-upload-main/scripts/run_openclaw_mcp.sh",
+        "args": [],
+        "cwd": "/Users/workstation/auto-upload-main",
+        "env": {
+          "AUTO_UPLOAD_PORT": "7790"
+        }
+      }
+    }
+  }
+}
+```
+
+登录二维码回发约定：
+
+- `login_and_wait` 返回 `channel_message`
+- 如果当前 OpenClaw 渠道支持图片发送，再发送 `channel_image_data_url`
+- 如果当前渠道不支持图片，至少把 `qr_url` 发给用户
+
+这样同一个 Agent 就可以在微信、飞书等渠道里把登录二维码发回当前会话。

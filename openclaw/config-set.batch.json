@@ -1,0 +1,13 @@
+[
+  {
+    "path": "mcp.servers.auto-upload",
+    "value": {
+      "command": "/Users/workstation/auto-upload-main/scripts/run_openclaw_mcp.sh",
+      "args": [],
+      "cwd": "/Users/workstation/auto-upload-main",
+      "env": {
+        "AUTO_UPLOAD_PORT": "7790"
+      }
+    }
+  }
+]

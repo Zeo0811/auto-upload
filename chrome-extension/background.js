@@ -34,6 +34,66 @@ function attachDebugger(tabId) {
   );
 }
 
+const _closingTabs = new Set();
+
+function detachDebuggerSafe(tabId) {
+  return new Promise((resolve) => {
+    chrome.debugger.detach({ tabId }, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+
+function getTabSafe(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      resolve(tab || null);
+    });
+  });
+}
+
+async function closeTabSafe(tabId, { useDebugger = false } = {}) {
+  if (!tabId || _closingTabs.has(tabId)) return;
+  _closingTabs.add(tabId);
+
+  try {
+    const tab = await getTabSafe(tabId);
+    if (!tab) return;
+
+    if (useDebugger) {
+      try {
+        await sendCommand(tabId, 'Page.enable', {});
+      } catch (_) {}
+    }
+
+    await new Promise((resolve) => {
+      chrome.tabs.remove(tabId, () => {
+        const err = chrome.runtime.lastError;
+        const msg = err?.message || '';
+        if (
+          msg &&
+          !msg.includes('No tab with given id') &&
+          !msg.includes('Tabs cannot be edited right now')
+        ) {
+          console.warn('[Auto Upload] closeTab 失败:', msg);
+        }
+        resolve();
+      });
+    });
+
+    if (useDebugger) {
+      await detachDebuggerSafe(tabId);
+    }
+  } finally {
+    _closingTabs.delete(tabId);
+  }
+}
+
 // 获取元素的视口坐标（用 getBoundingClientRect，兼容内层滚动容器）
 async function getViewportCenter(tabId, nodeId) {
   const { object } = await sendCommand(tabId, 'DOM.resolveNode', { nodeId });
@@ -689,21 +749,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 2. 用 CDP 自动处理 beforeunload 弹窗（防止 addEventListener 注册的监听器）
         try {
           await attachDebugger(tabId);
-          await sendCommand(tabId, 'Page.enable', {});
           // 监听弹窗并自动确认离开
           const dialogHandler = (source, method, params) => {
             if (source.tabId !== tabId || method !== 'Page.javascriptDialogOpening') return;
             sendCommand(tabId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
           };
           chrome.debugger.onEvent.addListener(dialogHandler);
-          // 关闭标签页，如果弹窗出现会被自动处理
-          chrome.tabs.remove(tabId, () => {
-            chrome.debugger.onEvent.removeListener(dialogHandler);
-            chrome.debugger.detach({ tabId }, () => {});
-          });
+          await closeTabSafe(tabId, { useDebugger: true });
+          chrome.debugger.onEvent.removeListener(dialogHandler);
         } catch (_) {
-          // CDP 失败时直接关闭
-          chrome.tabs.remove(tabId);
+          await closeTabSafe(tabId);
         }
       })();
     }
