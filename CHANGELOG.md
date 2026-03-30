@@ -47,7 +47,7 @@
 - **`login_and_wait` MCP tool**: 一次调用返回 QR 二维码（base64 data URL + HTTP URL），解决 AI 获取二维码发送到 IM 耗时过长的问题
 - **`upload_and_wait` MCP tool**: 提交上传 + 自动轮询等待完成，无需 AI 反复调用 `get_task_status`
 - **`delete_batch` / `delete_all_posts` MCP tools**: 补齐批量删除接口
-- **`GET /qr/{account_id}` HTTP 端点**: 浏览器直接访问 `http://127.0.0.1:7788/qr/test` 查看登录二维码，AI 只需发一个 URL 给用户
+- **`GET /qr/{account_id}` HTTP 端点**: 浏览器直接访问 `http://127.0.0.1:7790/qr/test` 查看登录二维码，AI 只需发一个 URL 给用户
 
 ### New Features — Claude Code Skills & 打包
 - **Claude Code Skills** (`.claude/commands/`): `/upload`、`/batch-upload`、`/manage` 三个快捷指令
@@ -88,6 +88,6 @@
 - 视频号登录（QR 扫码）
 - 内容管理：编辑、删除、列表查询（小红书 + 视频号）
 - Chrome Extension MV3 + CDP 自动化
-- Python HTTP Server（端口 7788）任务队列
+- Python HTTP Server（默认端口 7790，可由 `AUTO_UPLOAD_PORT` 覆盖）任务队列
 - 多视频源：本地文件、URL、OSS、Google Sheets / 飞书
 - Session 持久化登录状态

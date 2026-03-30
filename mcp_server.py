@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from mcp.server.fastmcp import FastMCP
 import tools
+from config import LOCAL_SERVER_BASE_URL
 
 mcp = FastMCP("auto-upload")
 
@@ -59,7 +60,7 @@ def login_and_wait(platform: str, account_id: str = "test") -> dict:
 
     return {
         "status": "qr_required",
-        "qr_url": f"http://127.0.0.1:7788/qr/{account_id}",
+        "qr_url": f"{LOCAL_SERVER_BASE_URL}/qr/{account_id}",
         "qr_base64": qr_base64,
         "qr_path": qr_path,
         "message": "请让用户在浏览器打开 qr_url 扫码登录，然后调用 check_login 轮询状态",
