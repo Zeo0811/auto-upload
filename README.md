@@ -32,7 +32,7 @@
 ## 架构
 
 ```
-Python 后端 (port 7788)  ←→  Chrome 扩展 (content.js + background.js)
+Python 后端 (default port 7790)  ←→  Chrome 扩展 (content.js + background.js)
        ↑                              ↓
   tools.py (API)              CDP (Chrome Debugger Protocol)
        ↑                              ↓
@@ -52,7 +52,7 @@ Python 后端 (port 7788)  ←→  Chrome 扩展 (content.js + background.js)
 │   ├── content.js          # 页面注入脚本，执行上传/管理流程
 │   └── background.js       # Service Worker，CDP 命令封装
 ├── core/
-│   ├── local_server.py     # HTTP 服务器 (port 7788)
+│   ├── local_server.py     # HTTP 服务器 (默认端口 7790，可由 AUTO_UPLOAD_PORT 覆盖)
 │   ├── session.py          # 登录会话持久化
 │   └── task_runner.py      # 任务管理
 ├── sources/                # 视频来源适配器

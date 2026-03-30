@@ -1,6 +1,8 @@
 sessions/
 tmp/
 tasks/
+state/
+.chrome-profile/
 __pycache__/
 *.pyc
 *.pyo

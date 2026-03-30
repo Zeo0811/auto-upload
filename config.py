@@ -1,9 +1,12 @@
 from pathlib import Path
+import os
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = BASE_DIR / "sessions"
 TMP_DIR = BASE_DIR / "tmp"
 TASKS_DIR = BASE_DIR / "tasks"
+LOCAL_SERVER_PORT = int(os.environ.get("AUTO_UPLOAD_PORT", "7790"))
+LOCAL_SERVER_BASE_URL = f"http://127.0.0.1:{LOCAL_SERVER_PORT}"
 
 # 确保目录存在
 for d in [SESSIONS_DIR, TMP_DIR, TASKS_DIR]:

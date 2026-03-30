@@ -2,7 +2,7 @@
 
 ## Architecture
 - **Python API** (`tools.py`): Core functions for login, upload, manage content
-- **HTTP Server** (`core/local_server.py`): Port 7788, bridges Python ↔ Chrome Extension
+- **HTTP Server** (`core/local_server.py`): Default port 7790, bridges Python ↔ Chrome Extension (`AUTO_UPLOAD_PORT` overrides)
 - **Chrome Extension** (`chrome-extension/`): MV3 + CDP automation for DOM interaction
 - **MCP Server** (`mcp_server.py`): Exposes tools.py as MCP tools for AI agents
 
@@ -24,7 +24,7 @@
 - `list_posts`, `edit_post`, `delete_post`, `delete_batch`, `delete_all_posts`
 
 ## QR Code Access
-- HTTP: `http://127.0.0.1:7788/qr/{account_id}` (open in browser)
+- HTTP: `http://127.0.0.1:7790/qr/{account_id}` by default (open in browser, overridable via `AUTO_UPLOAD_PORT`)
 - File: `tmp/qr_{account_id}.png`
 
 ## Supported Platforms

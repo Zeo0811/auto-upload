@@ -1,6 +1,6 @@
 """
 本地 HTTP 服务，供 Chrome 插件交互。
-端口 7788，后台线程运行，不依赖 asyncio。
+默认端口 7790，可由 AUTO_UPLOAD_PORT 覆盖；后台线程运行，不依赖 asyncio。
 """
 
 import base64
@@ -8,57 +8,126 @@ from typing import Optional
 import json
 import os
 import threading
+import tempfile
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from config import BASE_DIR
+from config import BASE_DIR, LOCAL_SERVER_PORT
 
 _server_started = False
 _server_lock = threading.Lock()
 
-# 当前待处理任务
-_pending_task: Optional[dict] = None
-_pending_task_lock = threading.Lock()
+STATE_DIR = BASE_DIR / "state"
+QUEUE_DIR = STATE_DIR / "queue"
+LOGIN_STATE_DIR = STATE_DIR / "login_state"
+LOGOUT_STATE_DIR = STATE_DIR / "logout_state"
+PROGRESS_DIR = STATE_DIR / "progress"
+RESULTS_DIR = STATE_DIR / "results"
+MANAGE_RESULTS_DIR = STATE_DIR / "manage_results"
+FILE_CACHE_DIR = STATE_DIR / "file_cache"
 
-# 进度存储 {task_id: {"progress": int, "msg": str}}
-_progress: dict[str, dict] = {}
-_progress_lock = threading.Lock()
+for d in [
+    STATE_DIR,
+    QUEUE_DIR,
+    LOGIN_STATE_DIR,
+    LOGOUT_STATE_DIR,
+    PROGRESS_DIR,
+    RESULTS_DIR,
+    MANAGE_RESULTS_DIR,
+    FILE_CACHE_DIR,
+]:
+    d.mkdir(parents=True, exist_ok=True)
 
-# 结果存储 {task_id: {"status": "done"|"fail", ...}}
-_results: dict[str, dict] = {}
-_results_lock = threading.Lock()
-
-# 登录请求 {account_id: str}
-_login_request: Optional[dict] = None
+_task_lock = threading.Lock()
 _login_request_lock = threading.Lock()
-
-# 登录状态 account_id → {status, qr_path}
-_login_state: dict = {}
-_login_state_lock = threading.Lock()
-
-# 退出登录请求 {account_id, platform, domain}
-_logout_request: Optional[dict] = None
 _logout_request_lock = threading.Lock()
-
-# 退出登录结果 account_id → {status, removed}
-_logout_state: dict = {}
+_progress_lock = threading.Lock()
+_results_lock = threading.Lock()
+_login_state_lock = threading.Lock()
 _logout_state_lock = threading.Lock()
-
-# 管理操作结果 {task_id: dict}
-_manage_results: dict[str, dict] = {}
 _manage_results_lock = threading.Lock()
+_file_cache_lock = threading.Lock()
+
+
+def _key_path(base: Path, key: str) -> Path:
+    return base / f"{key}.json"
+
+
+def _atomic_write_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        delete=False,
+    ) as tmp:
+        json.dump(data, tmp, ensure_ascii=False)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _delete_file(path: Path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _pop_json(path: Path) -> Optional[dict]:
+    data = _read_json(path)
+    if data is not None:
+        _delete_file(path)
+    return data
+
+
+def _queue_path(name: str) -> Path:
+    return QUEUE_DIR / f"{name}.json"
+
+
+def _set_queue(name: str, data: dict):
+    _atomic_write_json(_queue_path(name), data)
+
+
+def _get_queue(name: str, consume: bool = False) -> Optional[dict]:
+    path = _queue_path(name)
+    return _pop_json(path) if consume else _read_json(path)
+
+
+def _set_keyed_state(base: Path, key: str, data: dict):
+    _atomic_write_json(_key_path(base, key), data)
+
+
+def _get_keyed_state(base: Path, key: str) -> Optional[dict]:
+    return _read_json(_key_path(base, key))
+
+
+def _clear_keyed_state(base: Path, key: str):
+    _delete_file(_key_path(base, key))
 
 
 def get_result(task_id: str) -> Optional[dict]:
     """有结果时返回 dict，否则返回 None"""
     with _results_lock:
-        return _results.get(task_id)
+        return _get_keyed_state(RESULTS_DIR, task_id)
 
 
 def get_progress(task_id: str) -> dict:
     """返回当前进度，无记录时返回空 dict"""
     with _progress_lock:
-        return dict(_progress.get(task_id, {}))
+        return _get_keyed_state(PROGRESS_DIR, task_id) or {}
 
 
 # --------------------------------------------------------------------------- #
@@ -109,37 +178,39 @@ class _Handler(BaseHTTPRequestHandler):
 
         # GET /task → 消费一次，之后返回 {}
         if path == "/task":
-            with _pending_task_lock:
-                global _pending_task
-                task = _pending_task
-                _pending_task = None
+            with _task_lock:
+                task = _get_queue("task", consume=True)
             self._json(task if task else {})
             return
 
         # GET /login_request → 消费一次，之后返回 {}
         if path == "/login_request":
             with _login_request_lock:
-                global _login_request
-                req = _login_request
-                _login_request = None
+                req = _get_queue("login_request", consume=True)
             self._json(req if req else {})
             return
 
         # GET /logout_request → 消费一次，之后返回 {}
         if path == "/logout_request":
             with _logout_request_lock:
-                global _logout_request
-                req = _logout_request
-                _logout_request = None
+                req = _get_queue("logout_request", consume=True)
             self._json(req if req else {})
+            return
+
+        # GET /health → 用于确认当前监听端口的服务属于哪个项目目录
+        if path == "/health":
+            self._json({
+                "ok": True,
+                "base_dir": str(BASE_DIR),
+            })
             return
 
         # GET /file/<task_id> → 流式返回视频文件
         if path.startswith("/file/"):
             task_id = path[len("/file/"):]
-            # 从 _results/progress 里找不到 file_path，需要从历史任务数据取
-            # 实际 file_path 由 post_task 时缓存
-            file_path = _file_cache.get(task_id)
+            with _file_cache_lock:
+                cache = _get_keyed_state(FILE_CACHE_DIR, task_id) or {}
+            file_path = cache.get("file_path", "")
             if not file_path or not os.path.isfile(file_path):
                 self.send_response(404)
                 self._cors_headers()
@@ -195,10 +266,10 @@ class _Handler(BaseHTTPRequestHandler):
             task_id = body.get("task_id", "")
             if task_id:
                 with _progress_lock:
-                    _progress[task_id] = {
+                    _set_keyed_state(PROGRESS_DIR, task_id, {
                         "progress": body.get("progress", 0),
                         "msg": body.get("msg", ""),
-                    }
+                    })
             self._json({"ok": True})
             return
 
@@ -207,10 +278,10 @@ class _Handler(BaseHTTPRequestHandler):
             task_id = body.get("task_id", "")
             if task_id:
                 with _results_lock:
-                    _results[task_id] = {
+                    _set_keyed_state(RESULTS_DIR, task_id, {
                         "status": "done",
                         "post_url": body.get("post_url", ""),
-                    }
+                    })
             self._json({"ok": True})
             return
 
@@ -219,28 +290,26 @@ class _Handler(BaseHTTPRequestHandler):
             task_id = body.get("task_id", "")
             if task_id:
                 with _results_lock:
-                    _results[task_id] = {
+                    _set_keyed_state(RESULTS_DIR, task_id, {
                         "status": "fail",
                         "error": body.get("error", "未知错误"),
-                    }
+                    })
             self._json({"ok": True})
             return
 
         # POST /restore_task — 插件将不匹配平台的任务放回队列
         if path == "/restore_task":
-            with _pending_task_lock:
-                global _pending_task
-                if _pending_task is None:
-                    _pending_task = body
+            with _task_lock:
+                if _get_queue("task") is None:
+                    _set_queue("task", body)
             self._json({"ok": True})
             return
 
         # POST /restore_login_request — 插件将不匹配平台的请求放回队列
         if path == "/restore_login_request":
             with _login_request_lock:
-                global _login_request
-                if _login_request is None:   # 只有队列为空时才放回，避免覆盖新请求
-                    _login_request = body
+                if _get_queue("login_request") is None:
+                    _set_queue("login_request", body)
             self._json({"ok": True})
             return
 
@@ -249,7 +318,7 @@ class _Handler(BaseHTTPRequestHandler):
             task_id = body.get("task_id", "")
             if task_id:
                 with _manage_results_lock:
-                    _manage_results[task_id] = body
+                    _set_keyed_state(MANAGE_RESULTS_DIR, task_id, body)
             self._json({"ok": True})
             return
 
@@ -287,7 +356,7 @@ class _Handler(BaseHTTPRequestHandler):
                 elif "error" in body:
                     state["error"] = body.get("error", "")
                 with _login_state_lock:
-                    _login_state[account_id] = state
+                    _set_keyed_state(LOGIN_STATE_DIR, account_id, state)
             self._json({"ok": True})
             return
 
@@ -296,7 +365,7 @@ class _Handler(BaseHTTPRequestHandler):
             account_id = body.get("account_id", "")
             if account_id:
                 with _logout_state_lock:
-                    _logout_state[account_id] = body
+                    _set_keyed_state(LOGOUT_STATE_DIR, account_id, body)
             self._json({"ok": True})
             return
 
@@ -304,85 +373,100 @@ class _Handler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
 
-
-# file_path 缓存，供 GET /file/<task_id> 使用
-_file_cache: dict[str, str] = {}
-
-
 # --------------------------------------------------------------------------- #
 # 对外 API
 # --------------------------------------------------------------------------- #
 
-def start_server(port: int = 7788):
+def start_server(port: int = LOCAL_SERVER_PORT):
     """启动本地 HTTP 服务（幂等，只启动一次）"""
     global _server_started
     with _server_lock:
         if _server_started:
             return
-        server = HTTPServer(("127.0.0.1", port), _Handler)
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-        _server_started = True
+        try:
+            server = HTTPServer(("127.0.0.1", port), _Handler)
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            _server_started = True
+        except OSError as e:
+            if e.errno == 48:  # Address already in use
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    running_base_dir = os.path.realpath(data.get("base_dir", ""))
+                    current_base_dir = os.path.realpath(str(BASE_DIR))
+                    if running_base_dir == current_base_dir:
+                        _server_started = True
+                        return
+                    raise RuntimeError(
+                        f"端口 {port} 已被其他 Auto Upload 实例占用: {data.get('base_dir', 'unknown')}"
+                    )
+                except RuntimeError:
+                    raise
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                    raise RuntimeError(
+                        f"端口 {port} 已被其他进程占用，当前项目无法启动本地服务。"
+                    )
+            raise
 
 
 def post_task(task_id: str, file_path: str, meta: dict, platform: str = ''):
     """发布一个待处理任务"""
-    _file_cache[task_id] = file_path
-    with _pending_task_lock:
-        global _pending_task
-        _pending_task = {
+    task = {
             "task_id": task_id,
             "file_path": file_path,
             "meta": meta,
             "platform": platform,
         }
+    with _file_cache_lock:
+        _set_keyed_state(FILE_CACHE_DIR, task_id, {"file_path": file_path})
+    with _task_lock:
+        _set_queue("task", task)
     with _progress_lock:
-        _progress[task_id] = {"progress": 0, "msg": "等待插件领取任务"}
+        _set_keyed_state(PROGRESS_DIR, task_id, {"progress": 0, "msg": "等待插件领取任务"})
     with _results_lock:
-        _results.pop(task_id, None)
+        _clear_keyed_state(RESULTS_DIR, task_id)
 
 
 def set_login_request(account_id: str, platform: str = ''):
     """Python 触发一次登录检测"""
-    global _login_request
     with _login_request_lock:
-        _login_request = {"account_id": account_id, "platform": platform}
+        _set_queue("login_request", {"account_id": account_id, "platform": platform})
 
 
 def get_login_state(account_id: str) -> dict:
     """返回当前登录状态，无记录返回 {}"""
     with _login_state_lock:
-        return dict(_login_state.get(account_id, {}))
+        return _get_keyed_state(LOGIN_STATE_DIR, account_id) or {}
 
 
 def clear_login_state(account_id: str):
     """清除登录状态（下次重新检测）"""
     with _login_state_lock:
-        _login_state.pop(account_id, None)
+        _clear_keyed_state(LOGIN_STATE_DIR, account_id)
 
 
 def set_logout_request(account_id: str, platform: str, domain: str):
     """Python 触发退出登录请求"""
-    global _logout_request
     with _logout_request_lock:
-        _logout_request = {"account_id": account_id, "platform": platform, "domain": domain}
+        _set_queue("logout_request", {"account_id": account_id, "platform": platform, "domain": domain})
     with _logout_state_lock:
-        _logout_state.pop(account_id, None)
+        _clear_keyed_state(LOGOUT_STATE_DIR, account_id)
 
 
 def get_logout_state(account_id: str) -> dict:
     """返回退出登录结果，无记录返回 {}"""
     with _logout_state_lock:
-        return dict(_logout_state.get(account_id, {}))
+        return _get_keyed_state(LOGOUT_STATE_DIR, account_id) or {}
 
 
 def get_manage_result(task_id: str) -> Optional[dict]:
     """获取管理操作结果，有则返回 dict，否则 None"""
     with _manage_results_lock:
-        return _manage_results.get(task_id)
+        return _get_keyed_state(MANAGE_RESULTS_DIR, task_id)
 
 
 def clear_manage_result(task_id: str):
     """清除管理操作结果"""
     with _manage_results_lock:
-        _manage_results.pop(task_id, None)
+        _clear_keyed_state(MANAGE_RESULTS_DIR, task_id)

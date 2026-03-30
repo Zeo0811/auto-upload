@@ -7,12 +7,42 @@ import asyncio
 import sys
 import os
 import time
+import subprocess
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from core.session import load_session, save_session, delete_session
 from core.task_runner import create_task, update_task, get_task, run_task_in_background
-from config import TMP_DIR, PLATFORM_MANAGE_URLS
+from config import BASE_DIR, TMP_DIR, PLATFORM_MANAGE_URLS
+
+
+CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_USER_DATA_DIR = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+CHROME_PROFILE_DIR = "Default"
+
+
+def _open_chrome(url: str) -> None:
+    """Open Chrome using the user's existing Chrome profile."""
+    chrome_args = [
+        CHROME_APP,
+        f"--user-data-dir={CHROME_USER_DATA_DIR}",
+        f"--profile-directory={CHROME_PROFILE_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
+    ]
+    try:
+        subprocess.Popen(
+            chrome_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        subprocess.Popen(
+            ["open", "-a", "Google Chrome", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 # ====================================================================== #
@@ -33,7 +63,6 @@ def login(platform: str, account_id: str) -> dict:
 
       {"status": "error", "error": "..."}
     """
-    import subprocess
     from core.local_server import start_server, set_login_request, get_login_state, clear_login_state
 
     start_server()
@@ -43,7 +72,7 @@ def login(platform: str, account_id: str) -> dict:
     # 打开 Chrome 到 XHS 创作页
     from config import PLATFORM_URLS
     url = PLATFORM_URLS.get(platform, "https://creator.xiaohongshu.com/publish/publish")
-    subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
+    _open_chrome(url)
 
     # 等插件报告登录状态（最多 30 秒）
     deadline = time.time() + 90
@@ -84,7 +113,6 @@ def logout(platform: str, account_id: str) -> dict:
       {"status": "ok", "message": "未找到登录状态，无需退出"}
       {"status": "error", "error": "..."}
     """
-    import subprocess
     from core.local_server import start_server, set_logout_request, get_logout_state
 
     # 删除本地 session
@@ -102,7 +130,7 @@ def logout(platform: str, account_id: str) -> dict:
     from config import PLATFORM_URLS
     url = PLATFORM_URLS.get(platform, "")
     if url:
-        subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
+        _open_chrome(url)
     time.sleep(5)  # 等标签页加载 + content.js 注入
 
     set_logout_request(account_id, platform, domain)
@@ -151,7 +179,6 @@ def check_login(platform: str, account_id: str) -> dict:
       {"status": "qr_refreshed", "qr_path": "..."}  二维码已自动刷新，需重新展示给用户
       {"status": "error", "error": "..."}
     """
-    import subprocess
     from core.local_server import get_login_state, clear_login_state, set_login_request
 
     state = get_login_state(account_id)
@@ -179,7 +206,7 @@ def check_login(platform: str, account_id: str) -> dict:
                 from config import PLATFORM_URLS
                 url = PLATFORM_URLS.get(platform, "")
                 if url:
-                    subprocess.run(["open", "-a", "Google Chrome", url], capture_output=True)
+                    _open_chrome(url)
                 # 等待插件重新获取二维码
                 deadline = time.time() + 30
                 while time.time() < deadline:
@@ -248,7 +275,6 @@ def upload_video(
             update_task(task_id, status="uploading", progress=10)
 
             from core.local_server import start_server, post_task, get_result, get_progress
-            import subprocess
             start_server()
             post_task(task_id, str(video_path), meta, platform)
 
@@ -261,10 +287,7 @@ def upload_video(
                 # 没有标签页在运行，打开 Chrome
                 from config import PLATFORM_URLS
                 open_url = PLATFORM_URLS.get(platform, "https://creator.xiaohongshu.com/publish/publish")
-                subprocess.run(
-                    ["open", "-a", "Google Chrome", open_url],
-                    capture_output=True
-                )
+                _open_chrome(open_url)
 
             timeout = 900
             start = time.time()
@@ -352,7 +375,6 @@ def batch_upload(
 
 def _submit_manage_task(platform: str, account_id: str, manage_type: str, params: dict, timeout: int = 300) -> dict:
     """提交管理任务到插件并等待结果的通用函数。自动处理登录。"""
-    import subprocess
     from core.local_server import start_server, post_task, get_manage_result, clear_manage_result, get_progress
 
     start_server()
@@ -382,7 +404,7 @@ def _submit_manage_task(platform: str, account_id: str, manage_type: str, params
     # 打开管理页（先开页面，等插件加载后再投递任务）
     manage_url = PLATFORM_MANAGE_URLS.get(platform)
     if manage_url:
-        subprocess.run(["open", "-a", "Google Chrome", manage_url], capture_output=True)
+        _open_chrome(manage_url)
 
     # 等页面加载 + 插件初始化
     time.sleep(4)
@@ -423,7 +445,7 @@ def _submit_manage_task(platform: str, account_id: str, manage_type: str, params
                     print(f"[管理操作] 登录成功，重新打开管理页面...")
                     # 登录后标签页已关闭，需要重新打开管理页面并重新投递任务
                     if manage_url:
-                        subprocess.run(["open", "-a", "Google Chrome", manage_url], capture_output=True)
+                        _open_chrome(manage_url)
                     time.sleep(4)
                     clear_manage_result(task_id)
                     post_task(task_id, "", manage_meta, platform)
